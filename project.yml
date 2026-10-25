@@ -1,0 +1,24 @@
+name: RamTidy
+options:
+  deploymentTarget:
+    iOS: "17.0"
+targets:
+  RamTidy:
+    type: application
+    platform: iOS
+    sources: [RamTidy]
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: com.example.ramtidy   # change to something unique
+        MARKETING_VERSION: "1.0"
+        CURRENT_PROJECT_VERSION: "1"
+        SWIFT_VERSION: "5.9"
+        GENERATE_INFOPLIST_FILE: YES
+        INFOPLIST_KEY_UILaunchScreen_Generation: YES
+        INFOPLIST_KEY_CFBundleDisplayName: RamTidy
+    info:
+      path: RamTidy/Info.plist
+      properties:
+        UILaunchScreen: {}
+        UIBackgroundModes: [fetch]
+        BGTaskSchedulerPermittedIdentifiers: [com.example.ramtidy.refresh]
