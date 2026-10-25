@@ -1,5 +1,4 @@
-# RamTidy
-1. Create a new GitHub repo, upload everything in this folder (keep `.github/`).
-2. Edit `PRODUCT_BUNDLE_IDENTIFIER` in project.yml AND `refreshID` / the plist identifier to match.
-3. Actions tab → "Build IPA" → download the `RamTidy-unsigned-ipa` artifact.
-4. Sign + install with Sideloadly / AltStore / your own cert (free Apple ID = 7-day expiry).
+# PowerPilot
+iOS app: live battery + thermal monitoring, tips, history charts, alerts, and a full set of Shortcuts actions.
+CI builds an unsigned IPA (Actions tab / Releases → "latest"). Sign with iLoader, Sideloadly or AltStore.
+Change `com.example.powerpilot` in project.yml (and the refresh ID in PowerPilotApp.swift) if your signer needs a unique bundle ID.
