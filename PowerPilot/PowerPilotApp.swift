@@ -1,5 +1,13 @@
 import SwiftUI
 import BackgroundTasks
+import UserNotifications
+
+final class NotifDelegate: NSObject, UNUserNotificationCenterDelegate {
+    static let shared = NotifDelegate()
+    func userNotificationCenter(_ center: UNUserNotificationCenter, willPresent notification: UNNotification) async -> UNNotificationPresentationOptions {
+        [.banner, .list, .sound]
+    }
+}
 
 let refreshID = "com.example.powerpilot.refresh"
 
@@ -20,6 +28,8 @@ func runBackgroundCheck() async {
 struct PowerPilotApp: App {
     @AppStorage(Keys.appearance) private var appearance = "system"
     @Environment(\.scenePhase) private var phase
+
+    init() { UNUserNotificationCenter.current().delegate = NotifDelegate.shared }
 
     private var scheme: ColorScheme? {
         switch appearance {

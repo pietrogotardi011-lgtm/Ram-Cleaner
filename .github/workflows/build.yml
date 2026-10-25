@@ -9,6 +9,8 @@ jobs:
     runs-on: macos-15
     steps:
       - uses: actions/checkout@v4
+      - name: Lint shortcut files
+        run: for f in Shortcuts/*.shortcut; do plutil -lint "$f"; done
       - name: Install XcodeGen
         run: brew install xcodegen
       - name: Generate project

@@ -16,11 +16,12 @@ enum ThermalLevel: String, AppEnum {
     }
 }
 
-enum PowerProfileOption: String, AppEnum {
-    case maxBattery, cooldown, performance, overnight
+enum PowerProfileOption: String, AppEnum, CaseIterable {
+    case maxBattery, cooldown, performance, overnight, normal
     static var typeDisplayRepresentation: TypeDisplayRepresentation = "Power Profile"
     static var caseDisplayRepresentations: [PowerProfileOption: DisplayRepresentation] = [
-        .maxBattery: "Max Battery", .cooldown: "Cool Down", .performance: "Performance", .overnight: "Overnight"
+        .maxBattery: "Max Battery", .cooldown: "Cool Down", .performance: "Performance",
+        .overnight: "Overnight", .normal: "Normal"
     ]
     var title: String {
         switch self {
@@ -28,6 +29,26 @@ enum PowerProfileOption: String, AppEnum {
         case .cooldown: return "Cool Down"
         case .performance: return "Performance"
         case .overnight: return "Overnight"
+        case .normal: return "Normal"
+        }
+    }
+    var shortcutName: String { "PowerPilot \(title)" }
+    var brightness: Double {
+        switch self {
+        case .maxBattery: return 0.30
+        case .cooldown: return 0.20
+        case .performance: return 0.70
+        case .overnight: return 0.0
+        case .normal: return 0.60
+        }
+    }
+    var detail: String {
+        switch self {
+        case .maxBattery: return "Low Power Mode on, brightness 30%, Bluetooth off. For when the battery is low."
+        case .cooldown: return "Low Power Mode on, brightness 20%, Bluetooth off. For when the phone is hot."
+        case .performance: return "Low Power Mode off, brightness 70%, Wi-Fi on. For full speed."
+        case .overnight: return "Low Power Mode on, screen dark, Bluetooth off. For sleeping."
+        case .normal: return "Restores Low Power Mode off, brightness 60%, Bluetooth and Wi-Fi on."
         }
     }
 }
@@ -135,10 +156,11 @@ struct GetBatteryTrendIntent: AppIntent {
 struct CheckAndAlertIntent: AppIntent {
     static var title: LocalizedStringResource = "Check and Alert"
     static var description = IntentDescription("Checks heat, charge limit and low battery, sends notifications per your settings, and returns what it found.")
+    @Parameter(title: "Ignore cooldown", default: false) var ignoreCooldown: Bool
     func perform() async throws -> some IntentResult & ReturnsValue<String> {
         let s = await Monitor.snapshot()
         Store.append(s)
-        let msgs = await Notifier.evaluate(s)
+        let msgs = await Notifier.evaluate(s, force: ignoreCooldown)
         return .result(value: msgs.isEmpty ? "All clear. \(s.summary)" : msgs.joined(separator: "\n"))
     }
 }

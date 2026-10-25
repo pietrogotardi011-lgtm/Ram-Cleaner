@@ -37,37 +37,7 @@ enum Advice {
     }
 
     static func steps(_ p: PowerProfileOption) -> String {
-        let lines: [String]
-        switch p {
-        case .maxBattery:
-            lines = ["Max Battery profile. Run these Shortcuts actions:",
-                     "1. Set Low Power Mode → On",
-                     "2. Set Brightness → 30%",
-                     "3. Set Appearance → Dark",
-                     "4. Set Bluetooth → Off (if unused)",
-                     "5. Set Cellular Data → Wi-Fi only when at home"]
-        case .cooldown:
-            lines = ["Cool Down profile. Run these Shortcuts actions:",
-                     "1. Set Brightness → 20%",
-                     "2. Set Low Power Mode → On",
-                     "3. Set Bluetooth → Off",
-                     "4. Stop charging and remove the case",
-                     "5. Close heavy apps and wait a few minutes"]
-        case .performance:
-            lines = ["Performance profile. Run these Shortcuts actions:",
-                     "1. Set Low Power Mode → Off",
-                     "2. Set Brightness → 70%",
-                     "3. Set Wi-Fi → On",
-                     "4. Keep the phone cool; heat is what throttles speed"]
-        case .overnight:
-            lines = ["Overnight profile. Run these Shortcuts actions:",
-                     "1. Set Low Power Mode → On",
-                     "2. Set Brightness → 0%",
-                     "3. Set Bluetooth → Off",
-                     "4. Turn on a Sleep Focus",
-                     "5. Unplug around \(Prefs.chargeLimit)% if you charge manually"]
-        }
-        return lines.joined(separator: "\n")
+        "\(p.title): run the shortcut \"\(p.shortcutName)\".\n\(p.detail)\nBrightness target: \(Int(p.brightness * 100))%."
     }
 }
 
@@ -76,14 +46,39 @@ enum Notifier {
         UNUserNotificationCenter.current().requestAuthorization(options: [.alert, .sound]) { _, _ in }
     }
 
-    static func post(title: String, body: String) async {
+    static func status() async -> UNAuthorizationStatus {
+        await UNUserNotificationCenter.current().notificationSettings().authorizationStatus
+    }
+
+    static func statusText(_ s: UNAuthorizationStatus) -> String {
+        switch s {
+        case .authorized: return "Allowed"
+        case .denied: return "Blocked in iOS Settings"
+        case .notDetermined: return "Not asked yet"
+        case .provisional: return "Provisional"
+        case .ephemeral: return "Ephemeral"
+        @unknown default: return "Unknown"
+        }
+    }
+
+    @discardableResult
+    static func post(title: String, body: String, delay: TimeInterval = 0) async -> Bool {
         let c = UNUserNotificationCenter.current()
-        let s = await c.notificationSettings()
-        guard s.authorizationStatus == .authorized else { return }
+        var st = await c.notificationSettings().authorizationStatus
+        if st == .notDetermined {
+            _ = try? await c.requestAuthorization(options: [.alert, .sound])
+            st = await c.notificationSettings().authorizationStatus
+        }
+        guard st == .authorized || st == .provisional else { return false }
         let content = UNMutableNotificationContent()
         content.title = title
         content.body = body
-        try? await c.add(UNNotificationRequest(identifier: UUID().uuidString, content: content, trigger: nil))
+        content.sound = .default
+        let trigger: UNNotificationTrigger? = delay > 0 ? UNTimeIntervalNotificationTrigger(timeInterval: delay, repeats: false) : nil
+        do {
+            try await c.add(UNNotificationRequest(identifier: UUID().uuidString, content: content, trigger: trigger))
+            return true
+        } catch { return false }
     }
 
     private static func cooldownOK(_ kind: String) -> Bool {
@@ -94,8 +89,8 @@ enum Notifier {
         UserDefaults.standard.set(Date().timeIntervalSince1970, forKey: "last_\(kind)")
     }
 
-    /// Returns the alert messages that currently apply; posts notifications (30 min cooldown per kind).
-    static func evaluate(_ s: Snapshot) async -> [String] {
+    /// Returns the alert messages that currently apply. Posts notifications; `force` ignores the 30 min cooldown.
+    static func evaluate(_ s: Snapshot, force: Bool = false) async -> [String] {
         var found: [(kind: String, enabled: Bool, title: String, body: String)] = []
         if s.thermal >= Prefs.hotThreshold {
             found.append(("hot", Prefs.notifyHot, "Phone is hot",
@@ -112,9 +107,8 @@ enum Notifier {
         var msgs: [String] = []
         for f in found {
             msgs.append(f.body)
-            if Prefs.notify && f.enabled && cooldownOK(f.kind) {
-                await post(title: f.title, body: f.body)
-                mark(f.kind)
+            if Prefs.notify && f.enabled && (force || cooldownOK(f.kind)) {
+                if await post(title: f.title, body: f.body) { mark(f.kind) }
             }
         }
         return msgs

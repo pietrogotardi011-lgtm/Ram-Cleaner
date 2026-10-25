@@ -21,4 +21,7 @@ targets:
       properties:
         UILaunchScreen: {}
         UIBackgroundModes: [fetch]
+        CFBundleURLTypes:
+          - CFBundleURLName: com.example.powerpilot
+            CFBundleURLSchemes: [powerpilot]
         BGTaskSchedulerPermittedIdentifiers: [com.example.powerpilot.refresh]

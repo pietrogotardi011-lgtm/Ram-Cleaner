@@ -19,6 +19,7 @@ struct ContentView: View {
     var body: some View {
         TabView {
             DashboardView().tabItem { Label("Status", systemImage: "gauge.with.needle") }
+            ProfilesView().tabItem { Label("Profiles", systemImage: "bolt.circle") }
             HistoryView().tabItem { Label("History", systemImage: "chart.xyaxis.line") }
             SettingsView().tabItem { Label("Settings", systemImage: "slider.horizontal.3") }
             ShortcutsHelpView().tabItem { Label("Shortcuts", systemImage: "square.stack.3d.up") }
@@ -93,8 +94,14 @@ struct DashboardView: View {
                             let s = Monitor.snapshot()
                             snap = s
                             Store.append(s)
-                            let msgs = await Notifier.evaluate(s)
-                            result = msgs.isEmpty ? "All clear." : msgs.joined(separator: "\n")
+                            let msgs = await Notifier.evaluate(s, force: true)
+                            var text = msgs.isEmpty ? "All clear. No alert conditions right now." : msgs.joined(separator: "\n")
+                            if !msgs.isEmpty {
+                                let st = await Notifier.status()
+                                if !Prefs.notify { text += "\n(Notifications are turned off in PowerPilot settings.)" }
+                                else if st != .authorized { text += "\n(iOS notifications are \(Notifier.statusText(st)). Enable them in Settings → Notifications → PowerPilot.)" }
+                            }
+                            result = text
                         }
                     } label: {
                         Label("Check and alert now", systemImage: "bell.badge").frame(maxWidth: .infinity)
@@ -180,10 +187,26 @@ struct SettingsView: View {
     @AppStorage(Keys.autoLog) private var autoLog = true
     @AppStorage(Keys.intervalMinutes) private var interval = 15
     @AppStorage(Keys.appearance) private var appearance = "system"
+    @State private var authText = "Checking…"
+    @State private var testMsg = ""
 
     var body: some View {
         NavigationStack {
             Form {
+                Section("Notification status") {
+                    HStack { Text("iOS permission"); Spacer(); Text(authText).foregroundStyle(.secondary) }
+                    Button("Send test notification (in 5 s)") {
+                        Task {
+                            let ok = await Notifier.post(title: "PowerPilot test", body: "If you can read this, notifications work.", delay: 5)
+                            testMsg = ok ? "Sent. It arrives in 5 seconds; you can lock the phone." : "Could not send. Allow notifications for PowerPilot in iOS Settings."
+                            authText = Notifier.statusText(await Notifier.status())
+                        }
+                    }
+                    Button("Open iOS notification settings") {
+                        if let url = URL(string: UIApplication.openNotificationSettingsURLString) { UIApplication.shared.open(url) }
+                    }
+                    if !testMsg.isEmpty { Text(testMsg).font(.footnote).foregroundStyle(.secondary) }
+                }
                 Section("Notifications") {
                     Toggle("Enable notifications", isOn: $notify)
                         .onChange(of: notify) { _, on in if on { Notifier.requestAuth() } }
@@ -216,56 +239,109 @@ struct SettingsView: View {
                 }
             }
             .navigationTitle("Settings")
+            .task { authText = Notifier.statusText(await Notifier.status()) }
         }
     }
 }
 
-struct ShortcutsHelpView: View {
-    private let actions: [(String, String)] = [
-        ("Get Battery Status", "Text summary of everything"),
-        ("Get Battery Level", "Number, e.g. 72"),
-        ("Get Thermal State", "Nominal / Fair / Serious / Critical"),
-        ("Is Phone Hot?", "Yes/No (optional: include Fair)"),
-        ("Is Charging?", "Yes/No"),
-        ("Is Low Power Mode On?", "Yes/No"),
-        ("Is Battery Below?", "Yes/No for a percentage you choose"),
-        ("Should I Unplug?", "Yes/No based on your charge limit"),
-        ("Get Power Tips", "Text tips for right now"),
-        ("Get Battery Trend", "Drain or charge rate over 3 hours"),
-        ("Check and Alert", "Runs checks, sends notifications, returns findings"),
-        ("Log Battery Snapshot", "Adds a point to History"),
-        ("Apply Power Profile", "Returns steps for Max Battery, Cool Down, Performance or Overnight")
-    ]
-    private let recipes: [(String, String)] = [
-        ("Cool down automatically", "Automation: Time of Day every 15 min (or When charging starts) → Is Phone Hot? → If Yes → Set Low Power Mode On, Set Brightness 20%, Set Bluetooth Off."),
-        ("Protect the battery", "Automation: When charging starts → Should I Unplug? → If Yes → Show Notification, or use Check and Alert."),
-        ("Auto power saver", "Automation: Battery Level falls below 30% → Apply Power Profile (Max Battery) → Set Low Power Mode On, Set Brightness 30%."),
-        ("Overnight", "Automation: Time 23:00 → Apply Power Profile (Overnight) → Set Low Power Mode On, Set Brightness 0%.")
-    ]
+struct ProfilesView: View {
+    @State private var message = ""
 
     var body: some View {
         NavigationStack {
             List {
                 Section {
-                    Button("Open Shortcuts app") {
-                        if let url = URL(string: "shortcuts://") { UIApplication.shared.open(url) }
-                    }
-                    Text("PowerPilot reads the phone's real state. Apple's own Shortcuts actions (Low Power Mode, Brightness, Bluetooth…) make the changes. In Personal Automations, choose Run Immediately so they do not ask each time.")
+                    Text("Apply sets the screen brightness right now and runs the matching PowerPilot shortcut, which switches Low Power Mode, Bluetooth and Wi-Fi. Install the shortcuts from the Shortcuts tab first.")
                         .font(.footnote)
                 }
-                Section("Actions") {
-                    ForEach(actions, id: \.0) { a in
-                        VStack(alignment: .leading, spacing: 2) {
-                            Text(a.0).font(.headline)
-                            Text(a.1).font(.footnote).foregroundStyle(.secondary)
+                ForEach(PowerProfileOption.allCases, id: \.self) { p in
+                    VStack(alignment: .leading, spacing: 8) {
+                        Text(p.title).font(.headline)
+                        Text(p.detail).font(.footnote).foregroundStyle(.secondary)
+                        Button("Apply \(p.title)") { apply(p) }
+                            .buttonStyle(.borderedProminent)
+                    }
+                    .padding(.vertical, 4)
+                }
+                if !message.isEmpty { Section { Text(message).font(.footnote) } }
+            }
+            .navigationTitle("Profiles")
+        }
+    }
+
+    private func apply(_ p: PowerProfileOption) {
+        if let scene = UIApplication.shared.connectedScenes.compactMap({ $0 as? UIWindowScene }).first {
+            scene.screen.brightness = CGFloat(p.brightness)
+        }
+        message = "Brightness set to \(Int(p.brightness * 100))%. Running \"\(p.shortcutName)\"…"
+        let info = ShortcutInfo(name: p.shortcutName, summary: "")
+        if let url = info.runURL { UIApplication.shared.open(url) }
+    }
+}
+
+struct ShortcutsHelpView: View {
+    @Environment(\.openURL) private var openURL
+
+    private let recipes: [(String, String)] = [
+        ("Low battery → saver", "Shortcuts → Automation → + → Battery Level → Falls Below 30% → Run Immediately → Run Shortcut: PowerPilot Max Battery."),
+        ("Charged enough → unplug alert", "Automation → Battery Level → Rises Above 80% → Run Immediately → Run Shortcut: PowerPilot Unplug Alert."),
+        ("Bedtime", "Automation → Time of Day 23:00 → Run Immediately → Run Shortcut: PowerPilot Overnight. Add 07:00 → PowerPilot Normal."),
+        ("Back to normal on charger", "Automation → Charger → Is Connected → Run Immediately → Run Shortcut: PowerPilot Normal, then PowerPilot Log."),
+        ("Heat watch while gaming", "Automation → App → Is Opened → pick your game or Camera → Run Immediately → Run Shortcut: PowerPilot Heat Check.")
+    ]
+    private let intentActions: [(String, String)] = [
+        ("Get Battery Status", "Text summary"),
+        ("Get Battery Level", "Number, e.g. 72"),
+        ("Get Thermal State", "Nominal / Fair / Serious / Critical"),
+        ("Is Phone Hot?", "Yes/No"),
+        ("Is Charging?", "Yes/No"),
+        ("Is Low Power Mode On?", "Yes/No"),
+        ("Is Battery Below?", "Yes/No for a percentage"),
+        ("Should I Unplug?", "Yes/No from your charge limit"),
+        ("Get Power Tips", "Text tips"),
+        ("Get Battery Trend", "Rate over 3 hours"),
+        ("Check and Alert", "Checks, notifies, returns findings"),
+        ("Log Battery Snapshot", "Adds a point to History"),
+        ("Apply Power Profile", "Returns profile steps")
+    ]
+
+    var body: some View {
+        NavigationStack {
+            List {
+                Section("1. Install the shortcuts") {
+                    ForEach(ShortcutLinks.all) { sc in
+                        VStack(alignment: .leading, spacing: 6) {
+                            Text(sc.name).font(.headline)
+                            Text(sc.summary).font(.footnote).foregroundStyle(.secondary)
+                            HStack {
+                                Button(sc.link.isEmpty ? "Link not added yet" : "Install") {
+                                    if let u = URL(string: sc.link) { openURL(u) }
+                                }
+                                .buttonStyle(.bordered).disabled(sc.link.isEmpty)
+                                Button("Run") { if let u = sc.runURL { openURL(u) } }
+                                    .buttonStyle(.bordered)
+                            }
                         }
                     }
+                    Text("The Heat Check and Log shortcuts use PowerPilot's own actions. If one shows a missing action, open it in Shortcuts and re-add the action from PowerPilot.")
+                        .font(.footnote).foregroundStyle(.secondary)
                 }
-                Section("Recipes") {
+                Section("2. Create the automations") {
+                    Text("iOS does not allow automations to be shared, so create each one once. Choose Run Immediately so it never asks.")
+                        .font(.footnote)
+                    Button("Open Shortcuts app") { if let u = URL(string: "shortcuts://") { openURL(u) } }
                     ForEach(recipes, id: \.0) { r in
                         VStack(alignment: .leading, spacing: 2) {
                             Text(r.0).font(.headline)
                             Text(r.1).font(.footnote).foregroundStyle(.secondary)
+                        }
+                    }
+                }
+                Section("PowerPilot actions (for your own shortcuts)") {
+                    ForEach(intentActions, id: \.0) { a in
+                        VStack(alignment: .leading, spacing: 2) {
+                            Text(a.0).font(.subheadline.bold())
+                            Text(a.1).font(.footnote).foregroundStyle(.secondary)
                         }
                     }
                 }
