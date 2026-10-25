@@ -1,0 +1,28 @@
+name: Sign shortcuts
+on:
+  workflow_dispatch:
+permissions:
+  contents: write
+jobs:
+  sign:
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v4
+      - name: Try signing
+        continue-on-error: true
+        run: |
+          mkdir -p signed
+          touch sign.log
+          sw_vers | tee -a sign.log
+          for f in Shortcuts/*.shortcut; do
+            echo "== $f" | tee -a sign.log
+            shortcuts sign --mode anyone --input "$f" --output "signed/$(basename "$f")" 2>&1 | tee -a sign.log || true
+          done
+          ls -l signed | tee -a sign.log
+      - name: Publish result
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release delete shortcuts --cleanup-tag --yes || true
+          files=$(ls signed/*.shortcut 2>/dev/null || true)
+          gh release create shortcuts $files --title "Signed shortcuts" --notes-file sign.log
