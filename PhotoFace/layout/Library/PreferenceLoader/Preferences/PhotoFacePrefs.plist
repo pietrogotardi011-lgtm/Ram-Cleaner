@@ -6,5 +6,6 @@
 <key>cell</key><string>PSLinkCell</string>
 <key>detail</key><string>PFRootListController</string>
 <key>isController</key><true/>
+<key>icon</key><string>icon.png</string>
 <key>label</key><string>PhotoFace</string>
 </dict></dict></plist>

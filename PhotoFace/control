@@ -3,6 +3,7 @@ Name: PhotoFace
 Version: 0.2.1
 Architecture: iphoneos-arm
 Description: On-device photo-based face unlock for iPhones without Face ID
+Icon: file:///Library/PreferenceBundles/PhotoFacePrefs.bundle/package-icon.png
 Maintainer: you
 Author: you
 Section: Tweaks
