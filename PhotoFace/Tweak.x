@@ -56,8 +56,9 @@ static void PFLog(NSString *fmt, ...) {
     if ([at fileSize] > 200000) [[NSFileManager defaultManager] removeItemAtPath:p error:nil];
     NSString *line = [NSString stringWithFormat:@"%@ %@\n", [NSDate date], s];
     NSFileHandle *h = [NSFileHandle fileHandleForWritingAtPath:p];
-    if (!h) { [line writeToFile:p atomically:YES encoding:NSUTF8StringEncoding error:nil]; return; }
+    if (!h) { [line writeToFile:p atomically:YES encoding:NSUTF8StringEncoding error:nil]; chmod(p.fileSystemRepresentation, 0600); return; }
     [h seekToEndOfFile]; [h writeData:[line dataUsingEncoding:NSUTF8StringEncoding]]; [h closeFile];
+    chmod(p.fileSystemRepresentation, 0600);
 }
 static NSString *PFGuardPath(void) { return [kDir stringByAppendingPathComponent:@"guard"]; }
 static void PFGuardBegin(void) { [@"1" writeToFile:PFGuardPath() atomically:NO encoding:NSUTF8StringEncoding error:nil]; }
@@ -106,6 +107,7 @@ static float PFLimit(NSDictionary *db) {
 
 @interface PFScanner : NSObject <AVCaptureVideoDataOutputSampleBufferDelegate>
 @property (atomic) int mode; // 0 idle, 1 verify, 2 enroll, 3 test
+@property (atomic) BOOL sawMismatch; // verify saw a face repeatedly that did not match
 @property (nonatomic, readonly) AVCaptureSession *session;
 @property (nonatomic, copy) void (^progress)(NSDictionary *info);
 + (instancetype)shared;
@@ -116,10 +118,10 @@ static float PFLimit(NSDictionary *db) {
 @implementation PFScanner {
     AVCaptureSession *_s; dispatch_queue_t _q; CIContext *_ci; NSTimer *_wd;
     NSTimeInterval _startTS, _deadlineTS, _lastFrameTS, _lastProc, _lastGain;
-    int _frames, _hits, _center, _secCount[8];
+    int _frames, _hits, _miss, _center, _secCount[8];
     NSMutableArray *_got; NSMutableArray<NSNumber *> *_bins;
     NSDictionary *_db; void (^_done)(BOOL, NSString *);
-    NSString *_interrupt; BOOL _observing, _retried; dispatch_queue_t _cfg;
+    NSString *_interrupt; BOOL _observing; int _retries; dispatch_queue_t _cfg; NSMutableArray *_obs;
 }
 @synthesize session = _s;
 
@@ -132,8 +134,19 @@ static float PFLimit(NSDictionary *db) {
     return i;
 }
 
+- (void)teardown {
+    for (id t in _obs) [[NSNotificationCenter defaultCenter] removeObserver:t];
+    [_obs removeAllObjects];
+    AVCaptureSession *old = _s; _s = nil;
+    if (old) dispatch_async(_cfg, ^{
+        for (AVCaptureOutput *o in old.outputs) { if ([o isKindOfClass:[AVCaptureVideoDataOutput class]]) [(AVCaptureVideoDataOutput *)o setSampleBufferDelegate:nil queue:nil]; }
+        [old stopRunning];
+    });
+}
+
 - (NSString *)build {
-    if (_s) return nil;
+    [self teardown];   // never reuse a session that may be wedged
+    if (!_obs) _obs = [NSMutableArray new];
     AVCaptureDevice *d = [AVCaptureDevice defaultDeviceWithDeviceType:AVCaptureDeviceTypeBuiltInWideAngleCamera
                                                             mediaType:AVMediaTypeVideo
                                                              position:AVCaptureDevicePositionFront];
@@ -142,6 +155,8 @@ static float PFLimit(NSDictionary *db) {
     AVCaptureDeviceInput *in = [AVCaptureDeviceInput deviceInputWithDevice:d error:&e];
     if (!in) return [NSString stringWithFormat:@"can't open the camera (%@)", e.localizedDescription ?: @"unknown"];
     AVCaptureSession *s = [AVCaptureSession new];
+    if (@available(iOS 10.0, *)) s.automaticallyConfiguresCaptureDeviceForWideColor = NO;
+    [s beginConfiguration];
     if ([s canSetSessionPreset:AVCaptureSessionPreset640x480]) s.sessionPreset = AVCaptureSessionPreset640x480;
     if (![s canAddInput:in]) return @"can't add camera input";
     [s addInput:in];
@@ -153,24 +168,32 @@ static float PFLimit(NSDictionary *db) {
     [s addOutput:o];
     AVCaptureConnection *c = [o connectionWithMediaType:AVMediaTypeVideo];
     if (c.isVideoOrientationSupported) c.videoOrientation = AVCaptureVideoOrientationPortrait;
+    [s commitConfiguration];
     _s = s;
     __weak PFScanner *ws = self;
     NSNotificationCenter *nc = [NSNotificationCenter defaultCenter];
-    [nc addObserverForName:AVCaptureSessionRuntimeErrorNotification object:s queue:nil usingBlock:^(NSNotification *n) {
+    [_obs addObject:[nc addObserverForName:AVCaptureSessionRuntimeErrorNotification object:s queue:nil usingBlock:^(NSNotification *n) {
         NSError *er = n.userInfo[AVCaptureSessionErrorKey];
         PFScanner *st = ws; if (!st) return;
         st->_interrupt = er.localizedDescription ?: @"camera runtime error";
         PFLog(@"runtime error: %@", er);
-    }];
-    [nc addObserverForName:AVCaptureSessionWasInterruptedNotification object:s queue:nil usingBlock:^(NSNotification *n) {
+    }]];
+    [_obs addObject:[nc addObserverForName:AVCaptureSessionWasInterruptedNotification object:s queue:nil usingBlock:^(NSNotification *n) {
         long r = [n.userInfo[AVCaptureSessionInterruptionReasonKey] longValue];
         PFScanner *st = ws; if (!st) return;
         st->_interrupt = [NSString stringWithFormat:@"camera interrupted (reason %ld)", r];
         PFLog(@"interrupted reason=%ld", r);
-    }];
-    [nc addObserverForName:AVCaptureSessionInterruptionEndedNotification object:s queue:nil usingBlock:^(NSNotification *n) {
+    }]];
+    [_obs addObject:[nc addObserverForName:AVCaptureSessionInterruptionEndedNotification object:s queue:nil usingBlock:^(NSNotification *n) {
         PFScanner *st = ws; if (st) st->_interrupt = nil;
-    }];
+        PFLog(@"interruption ended");
+    }]];
+    [_obs addObject:[nc addObserverForName:AVCaptureSessionDidStartRunningNotification object:s queue:nil usingBlock:^(NSNotification *n) {
+        PFLog(@"session did start running");
+    }]];
+    [_obs addObject:[nc addObserverForName:AVCaptureSessionDidStopRunningNotification object:s queue:nil usingBlock:^(NSNotification *n) {
+        PFLog(@"session did stop running");
+    }]];
     return nil;
 }
 
@@ -198,26 +221,41 @@ static float PFLimit(NSDictionary *db) {
     _frames = 0; _interrupt = nil; _lastProc = 0;
     _startTS = CACurrentMediaTime(); _lastFrameTS = _startTS; _lastGain = _startTS;
     _deadlineTS = _startTS + t;
-    _retried = NO;
+    _retries = 0; _miss = 0; self.sawMismatch = NO;
     PFGuardBegin();
     NSString *err = [self build];
     self.mode = mode;
     if (err) { [self finish:NO info:err]; return; }
-    dispatch_async(_cfg, ^{ [self->_s startRunning]; PFLog(@"startRunning returned, running=%d", self->_s.isRunning); });
+    [self launchSession];
     [_wd invalidate];
     _wd = [NSTimer scheduledTimerWithTimeInterval:0.5 target:self selector:@selector(tick) userInfo:nil repeats:YES];
+}
+
+- (void)launchSession {
+    AVCaptureSession *s = _s;
+    if (!s) return;
+    // give the backlight / lock screen a moment to settle before grabbing the camera
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 250 * NSEC_PER_MSEC), _cfg, ^{
+        if (!self.mode || s != self->_s) return;
+        [s startRunning];
+        PFLog(@"startRunning returned, running=%d interrupted=%d (try %d)", s.isRunning, s.isInterrupted, self->_retries);
+    });
 }
 
 - (void)tick {
     if (!self.mode) return;
     NSTimeInterval n = CACurrentMediaTime();
-    if (_frames == 0 && n - _startTS > 2.5 && !_retried) {
-        _retried = YES;
-        PFLog(@"no frames after 2.5s (running=%d interrupted=%d) - restarting session", _s.isRunning, _s.isInterrupted);
-        AVCaptureSession *rs = _s;
-        dispatch_async(_cfg, ^{ [rs stopRunning]; [rs startRunning]; });
+    // no frames: rebuild a brand-new session (new device input), up to 2 times
+    if (_frames == 0 && _retries < 2 && n - _startTS > 1.8 * (_retries + 1)) {
+        _retries++;
+        PFLog(@"no frames after %.1fs (running=%d interrupted=%d) - rebuilding session (retry %d)",
+              n - _startTS, _s.isRunning, _s.isInterrupted, _retries);
+        NSString *err = [self build];
+        if (err) { [self finish:NO info:err]; return; }
+        [self launchSession];
+        return;
     }
-    if (_frames == 0 && n - _startTS > 6) {
+    if (_frames == 0 && n - _startTS > 5.5) {
         [self finish:NO info:[NSString stringWithFormat:@"the camera isn't delivering frames (session running: %@, interrupted: %@%@)",
                               _s.isRunning ? @"yes" : @"no", _s.isInterrupted ? @"yes" : @"no",
                               _interrupt ? [NSString stringWithFormat:@", %@", _interrupt] : @""]];
@@ -326,6 +364,12 @@ static float PFLimit(NSDictionary *db) {
         return;
     }
 
+    if (mode == 1) {
+        // protection: only accept a face that is looking at the phone (frontal pose)
+        float yw = f.yaw ? f.yaw.floatValue : 0, pt = 0;
+        if (@available(iOS 15.0, *)) { if (f.pitch) pt = f.pitch.floatValue; }
+        if (fabsf(yw) > 0.45f || fabsf(pt) > 0.45f) { _hits = 0; return; }
+    }
     VNFeaturePrintObservation *fp = [self printFor:img face:f.boundingBox];
     if (!fp) return;
     float best = FLT_MAX;
@@ -334,8 +378,9 @@ static float PFLimit(NSDictionary *db) {
     }
     float limit = PFLimit(_db);
     if (mode == 3) { [self report:@{@"best": @(best), @"limit": @(limit), @"face": @YES}]; return; }
-    _hits = (best < limit) ? _hits + 1 : 0;
-    if (_hits >= 3) [self finish:YES info:[NSString stringWithFormat:@"match %.2f", best]];
+    if (best < limit) { _hits++; }
+    else { _hits = 0; if (mode == 1 && ++_miss >= 3) self.sawMismatch = YES; }
+    if (_hits >= 4) [self finish:YES info:[NSString stringWithFormat:@"match %.2f", best]];
 }
 
 - (void)finalizeEnroll {
@@ -459,6 +504,7 @@ static UIColor *PFGreen(void) { return [UIColor colorWithRed:0.19 green:0.82 blu
 
 - (void)addPreviewIfNeeded {
     AVCaptureSession *s = [PFScanner shared].session;
+    if (_pl && s && _pl.session != s) _pl.session = s;   // session was rebuilt after a retry
     if (_pl || !s || !_circle) return;
     _pl = [AVCaptureVideoPreviewLayer layerWithSession:s];
     _pl.videoGravity = AVLayerVideoGravityResizeAspectFill;
@@ -571,7 +617,11 @@ static void PFWakeInner(void) {
     NSString *pw = PFLoadPW(); // nil before first unlock after boot -> passcode required, like Touch ID
     if (!pw || ![[NSFileManager defaultManager] fileExistsAtPath:PFDBPath()]) return;
     [[PFScanner shared] start:1 timeout:6 done:^(BOOL ok, NSString *i) {
-        if (!ok || !PFIsLocked()) return;
+        if (!ok) {
+            if ([PFScanner shared].sawMismatch) { gFails++; PFLog(@"face seen but not matched (fails=%d)", gFails); }
+            return;
+        }
+        if (!PFIsLocked()) return;
         @try { PFUnlock(pw); } @catch (NSException *e) { PFLog(@"unlock exception: %@", e); }
         dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 1500 * NSEC_PER_MSEC), dispatch_get_main_queue(), ^{
             if (PFIsLocked()) gFails++;
