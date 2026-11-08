@@ -1,0 +1,35 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0"><dict>
+<key>title</key><string>PhotoFace</string>
+<key>items</key><array>
+ <dict><key>cell</key><string>PSGroupCell</string>
+  <key>footerText</key><string>Unlocks with a 2D front-camera photo match. This is much less secure than Face ID: a photo or video of you can fool it.</string></dict>
+ <dict><key>cell</key><string>PSSwitchCell</string>
+  <key>label</key><string>Enable PhotoFace</string>
+  <key>defaults</key><string>com.photoface.tweak</string>
+  <key>key</key><string>enabled</string>
+  <key>default</key><true/></dict>
+
+ <dict><key>cell</key><string>PSGroupCell</string><key>label</key><string>Face Data</string></dict>
+ <dict><key>cell</key><string>PSTitleValueCell</string>
+  <key>label</key><string>Status</string>
+  <key>get</key><string>statusText:</string></dict>
+ <dict><key>cell</key><string>PSButtonCell</string>
+  <key>label</key><string>Set Up / Re-enroll Face…</string>
+  <key>action</key><string>enroll:</string></dict>
+ <dict><key>cell</key><string>PSButtonCell</string>
+  <key>label</key><string>Remove Face Data</string>
+  <key>action</key><string>clearData:</string></dict>
+
+ <dict><key>cell</key><string>PSGroupCell</string>
+  <key>label</key><string>Tolerance</string>
+  <key>footerText</key><string>Raise it if PhotoFace often fails to recognise you. Lower it if you want it stricter.</string></dict>
+ <dict><key>cell</key><string>PSSliderCell</string>
+  <key>defaults</key><string>com.photoface.tweak</string>
+  <key>key</key><string>tolerance</string>
+  <key>default</key><real>1.25</real>
+  <key>min</key><real>1.0</real>
+  <key>max</key><real>2.0</real>
+  <key>showValue</key><true/></dict>
+</array></dict></plist>

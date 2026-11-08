@@ -15,5 +15,8 @@ pfenroll_FILES = pfenroll.c
 include $(THEOS_MAKE_PATH)/tweak.mk
 include $(THEOS_MAKE_PATH)/tool.mk
 
+SUBPROJECTS += prefs
+include $(THEOS_MAKE_PATH)/aggregate.mk
+
 before-package::
 	@chmod 0755 $(THEOS_STAGING_DIR)/DEBIAN/postinst

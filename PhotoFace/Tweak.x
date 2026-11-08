@@ -21,6 +21,16 @@
 
 static NSString *const kDir = @"/var/mobile/Library/PhotoFace";
 static NSString *const kService = @"com.photoface.passcode";
+static CFStringRef const kPrefDom = CFSTR("com.photoface.tweak");
+
+static id PFPrefGet(NSString *k) {
+    CFPreferencesAppSynchronize(kPrefDom);
+    return CFBridgingRelease(CFPreferencesCopyAppValue((__bridge CFStringRef)k, kPrefDom));
+}
+static void PFPrefSet(NSString *k, id v) {
+    CFPreferencesSetAppValue((__bridge CFStringRef)k, (__bridge CFPropertyListRef)v, kPrefDom);
+    CFPreferencesAppSynchronize(kPrefDom);
+}
 
 #pragma mark - storage
 
@@ -154,7 +164,11 @@ static NSDictionary *PFLoadDB(void) {
     for (VNFeaturePrintObservation *p in _db[@"prints"]) {
         float d; if ([fp computeDistance:&d toFeaturePrintObservation:p error:nil]) best = MIN(best, d);
     }
-    _hits = (best < [_db[@"th"] floatValue]) ? _hits + 1 : 0;
+    float base = _db[@"base"] ? [_db[@"base"] floatValue] : [_db[@"th"] floatValue] / 1.25f;
+    id tv = PFPrefGet(@"tolerance");
+    float tol = tv ? [tv floatValue] : 1.25f;
+    if (tol < 1.0f || tol > 2.0f) tol = 1.25f;
+    _hits = (best < base * tol) ? _hits + 1 : 0;
     if (_hits >= 3) [self finish:YES info:[NSString stringWithFormat:@"match %.2f", best]];
 }
 - (void)finalizeEnroll {
@@ -168,7 +182,7 @@ static NSDictionary *PFLoadDB(void) {
         if (mn < FLT_MAX) worst = MAX(worst, mn);
     }
     float th = worst * 1.25f;
-    NSDictionary *db = @{@"prints": [_got copy], @"th": @(th)};
+    NSDictionary *db = @{@"prints": [_got copy], @"th": @(th), @"base": @(worst)};
     NSData *dat = [NSKeyedArchiver archivedDataWithRootObject:db requiringSecureCoding:YES error:nil];
     if (!dat || ![dat writeToFile:PFDBPath() atomically:YES]) { [self finish:NO info:@"could not save"]; return; }
     chmod(PFDBPath().fileSystemRepresentation, 0600);
@@ -193,6 +207,8 @@ static void PFUnlock(NSString *pw) {
 static void PFWake(void) {
     SBLockScreenManager *m = [%c(SBLockScreenManager) sharedInstance];
     if ([m isUIUnlocked]) { gFails = 0; return; }
+    id en = PFPrefGet(@"enabled");
+    if (en && ![en boolValue]) return;      // master switch
     if (gFails >= 3) return;  // stop guessing if the stored passcode seems wrong
     NSString *pw = PFLoadPW(); // nil before first unlock after boot -> passcode required, like Touch ID
     if (!pw || ![[NSFileManager defaultManager] fileExistsAtPath:PFDBPath()]) return;
@@ -217,18 +233,25 @@ static void PFWake(void) {
         static int t1, t2;
         notify_register_dispatch("com.photoface.enroll", &t1, dispatch_get_main_queue(), ^(int t) {
             NSString *p = [kDir stringByAppendingPathComponent:@"passcode.tmp"];
-            NSString *pw = [NSString stringWithContentsOfFile:p encoding:NSUTF8StringEncoding error:nil];
+            NSString *pw = PFPrefGet(@"pendingPasscode");
+            PFPrefSet(@"pendingPasscode", nil);
+            if (!pw.length) pw = [NSString stringWithContentsOfFile:p encoding:NSUTF8StringEncoding error:nil];
             [[NSFileManager defaultManager] removeItemAtPath:p error:nil];
-            if (!pw.length) { PFStatus(@"fail: no passcode received"); return; }
+            if (!pw.length) { PFStatus(@"fail: no passcode received"); PFPrefSet(@"status", @"Failed: no passcode received"); return; }
             PFSavePW(pw);
             [[PFScanner shared] start:2 timeout:25 done:^(BOOL ok, NSString *i) {
                 gFails = 0;
                 PFStatus([NSString stringWithFormat:@"%@: %@", ok ? @"ok" : @"fail", i ?: @"unknown"]);
+                PFPrefSet(@"status", ok ? [NSString stringWithFormat:@"Enrolled (%@)", i]
+                                        : [NSString stringWithFormat:@"Failed: %@", i ?: @"unknown"]);
             }];
         });
         notify_register_dispatch("com.photoface.clear", &t2, dispatch_get_main_queue(), ^(int t) {
             [[NSFileManager defaultManager] removeItemAtPath:PFDBPath() error:nil];
             SecItemDelete((__bridge CFDictionaryRef)PFQ());
+            PFPrefSet(@"status", @"Not enrolled");
         });
+        PFPrefSet(@"pendingPasscode", nil);
+        PFPrefSet(@"status", [[NSFileManager defaultManager] fileExistsAtPath:PFDBPath()] ? @"Enrolled" : @"Not enrolled");
     }
 }
