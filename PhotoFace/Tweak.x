@@ -11,6 +11,7 @@
 #import <sys/stat.h>
 #import <objc/runtime.h>
 #import <objc/message.h>
+#import <mach-o/dyld.h>
 
 @interface SBLockScreenManager : NSObject
 + (instancetype)sharedInstance;
@@ -22,6 +23,9 @@
 - (BOOL)attemptUnlockWithPasscode:(NSString *)p;
 @end
 @interface SBBacklightController : NSObject
++ (instancetype)sharedInstance;
+- (BOOL)screenIsOn;
+- (BOOL)screenIsDim;
 - (void)turnOnScreenFullyWithBacklightSource:(long long)source;
 @end
 @interface SpringBoard : UIApplication
@@ -32,6 +36,8 @@ static NSString *const kDir = @"/var/mobile/Library/PhotoFace";
 static NSString *const kService = @"com.photoface.passcode";
 static CFStringRef const kPrefDom = CFSTR("com.photoface.tweak");
 static int gFails = 0;
+static BOOL PFScreenActive(void);
+static BOOL gForceScan = NO;
 static NSString *gPendingPW = nil;
 
 #pragma mark - helpers
@@ -45,7 +51,7 @@ static void PFPrefSet(NSString *k, id v) {
     CFPreferencesAppSynchronize(kPrefDom);
 }
 static CGFloat gIconYPct = 19, gIconXPct = 0;   // icon centre: % of screen height above the bottom, and -100..100 left/right
-static BOOL gHideOnPasscode = YES, gEarlyTrigger = YES;
+static BOOL gHideOnPasscode = YES, gEarlyTrigger = YES, gAODSafe = YES;
 static int gStartDelayMs = 80, gConfirmFrames = 2;
 static void PFLoadIconPos(void) {
     id y = PFPrefGet(@"iconYPct"), x = PFPrefGet(@"iconX"), h = PFPrefGet(@"hideOnPasscode");
@@ -53,6 +59,7 @@ static void PFLoadIconPos(void) {
     gStartDelayMs = sd ? MAX(0, MIN(600, (int)lroundf([sd floatValue]))) : 80;
     gConfirmFrames = cf ? MAX(1, MIN(4, (int)lroundf([cf floatValue]))) : 2;
     gEarlyTrigger = et ? [et boolValue] : YES;
+    id ao = PFPrefGet(@"aodSafe"); gAODSafe = ao ? [ao boolValue] : YES;
     gIconYPct = y ? MAX(0, MIN(100, [y floatValue])) : 19;
     gIconXPct = x ? MAX(-100, MIN(100, [x floatValue])) : 0;
     gHideOnPasscode = h ? [h boolValue] : YES;
@@ -327,6 +334,7 @@ static float PFLimit(NSDictionary *db) {
     if (!self.mode) return;
     NSTimeInterval n = CACurrentMediaTime();
     // no frames: rebuild a brand-new session (new device input), up to 2 times
+    if (self.mode == 1 && !PFScreenActive()) { [self finish:NO info:@"screen dimmed/off (AOD)"]; return; }
     if (_frames == 0 && _retries < 2 && n - _startTS > 1.0 * (_retries + 1)) {
         _retries++;
         PFLog(@"no frames after %.1fs (running=%d interrupted=%d) - rebuilding session (retry %d)",
@@ -675,6 +683,13 @@ static UIColor *PFGreen(void) { return [UIColor colorWithRed:0.19 green:0.82 blu
 static void PFRetry(void);
 static int gBlankTok = 0;
 static BOOL PFScreenOn(void) { uint64_t st = 1; if (gBlankTok) notify_get_state(gBlankTok, &st); return st == 0; }
+static BOOL PFScreenActive(void) {   // fully awake: not off, not dimmed by an always-on display
+    if (!gAODSafe) return YES;
+    SBBacklightController *b = [%c(SBBacklightController) sharedInstance];
+    if ([b respondsToSelector:@selector(screenIsOn)] && ![b screenIsOn]) return NO;
+    if ([b respondsToSelector:@selector(screenIsDim)] && [b screenIsDim]) return NO;
+    return YES;
+}
 typedef NS_ENUM(int, PFIconState) { PFIconLocked, PFIconScanning, PFIconUnlocked, PFIconFailed };
 
 @interface CSCoverSheetViewController : UIViewController
@@ -850,6 +865,12 @@ static BOOL PFIsLocked(void) {
 static void PFWakeInner(void) {
     if ([PFScanner shared].mode) return;   // already scanning
     if (!PFIsLocked()) { gFails = 0; return; }
+    {
+        SBBacklightController *bc = [%c(SBBacklightController) sharedInstance];
+        PFLog(@"wake: screen on=%d dim=%d blanked-token-on=%d forced=%d", [bc respondsToSelector:@selector(screenIsOn)] ? (int)[bc screenIsOn] : -1,
+              [bc respondsToSelector:@selector(screenIsDim)] ? (int)[bc screenIsDim] : -1, (int)PFScreenOn(), (int)gForceScan);
+    }
+    if (!gForceScan && !PFScreenActive()) { PFLog(@"wake: skipped, screen is dimmed/off (always-on display?)"); return; }
     id en = PFPrefGet(@"enabled");
     if (en && ![en boolValue]) { PFLog(@"wake: skipped, tweak switched off"); return; }      // master switch
     if (gFails >= 3) { PFLog(@"wake: skipped, locked out after %d fails", gFails); return; }
@@ -866,6 +887,7 @@ static void PFWakeInner(void) {
             [PFLockIcon setState:seen ? PFIconFailed : PFIconLocked];
             return;
         }
+        if (!gForceScan && !PFScreenActive()) { PFLog(@"match ignored: screen dimmed/off (always-on display?)"); [PFLockIcon setState:PFIconLocked]; return; }
         [PFLockIcon setState:PFIconUnlocked];
         if (!PFIsLocked()) return;
         // brief pause so the open padlock is visible, like Face ID
@@ -895,7 +917,9 @@ static void PFRetry(void) {
     gFails = 0;
     PFLog(@"retry: icon tapped");
     PFGuardBegin();
+    gForceScan = YES;
     @try { PFWakeInner(); } @catch (NSException *e) { PFLog(@"retry exception: %@", e); }
+    gForceScan = NO;
     if (![PFScanner shared].mode) PFGuardEnd();
 }
 
@@ -903,7 +927,7 @@ static void PFRetry(void) {
 - (void)viewWillAppear:(BOOL)a {
     %orig;
     [PFLockIcon attachTo:self.view refresh:YES]; [PFLockIcon watch:YES host:self.view];
-    if (gEarlyTrigger && PFScreenOn()) dispatch_async(dispatch_get_main_queue(), ^{ PFWake(); });   // start the camera as soon as the lock screen appears
+    if (gEarlyTrigger && PFScreenOn() && PFScreenActive()) dispatch_async(dispatch_get_main_queue(), ^{ PFWake(); });   // start the camera as soon as the lock screen appears
 }
 - (void)viewDidDisappear:(BOOL)a { %orig; [PFLockIcon watch:NO host:nil]; }
 - (void)viewDidLayoutSubviews { %orig; [PFLockIcon attachTo:self.view refresh:NO]; }
@@ -960,6 +984,16 @@ static void PFRetry(void) {
             PFLog(@"crash guard tripped: previous run did not finish; tweak switched off");
         } else {
             PFRefreshStatus();
+        }
+        {
+            NSMutableArray *hits = [NSMutableArray new];
+            for (uint32_t k = 0; k < _dyld_image_count(); k++) {
+                const char *n = _dyld_get_image_name(k);
+                if (!n) continue;
+                NSString *ns = [NSString stringWithUTF8String:n], *l = ns.lowercaseString;
+                if ([l containsString:@"/tweaks/"] || [l containsString:@"/tweakinject"]) [hits addObject:ns.lastPathComponent];
+            }
+            PFLog(@"loaded tweaks in SpringBoard: %@", [hits componentsJoinedByString:@" "]);
         }
         PFLog(@"PhotoFace loaded in SpringBoard");
         PFDumpCameraSwitches();

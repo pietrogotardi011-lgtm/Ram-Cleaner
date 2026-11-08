@@ -69,6 +69,15 @@
   <key>segmentCount</key><integer>3</integer>
   <key>showValue</key><true/></dict>
 
+ <dict><key>cell</key><string>PSGroupCell</string><key>label</key><string>Always-On Display</string>
+  <key>footerText</key><string>Don't scan or unlock while the screen is dimmed or off (for always-on display tweaks). Scanning starts when the screen fully wakes. Turn off only if PhotoFace never scans.</string></dict>
+ <dict><key>cell</key><string>PSSwitchCell</string>
+  <key>label</key><string>Ignore Always-On Display</string>
+  <key>defaults</key><string>com.photoface.tweak</string>
+  <key>key</key><string>aodSafe</string>
+  <key>PostNotification</key><string>com.photoface.prefschanged</string>
+  <key>default</key><true/></dict>
+
  <dict><key>cell</key><string>PSGroupCell</string><key>label</key><string>Face Data</string>
   <key>footerText</key><string>Set Up takes you to the Home Screen and shows a circle like Face ID setup: look at the camera, then slowly move your head in a circle. Use Test Recognition to see live match scores.</string></dict>
  <dict><key>cell</key><string>PSTitleValueCell</string>
