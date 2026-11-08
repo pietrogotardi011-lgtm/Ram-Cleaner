@@ -44,11 +44,20 @@ static void PFPrefSet(NSString *k, id v) {
     CFPreferencesSetAppValue((__bridge CFStringRef)k, (__bridge CFPropertyListRef)v, kPrefDom);
     CFPreferencesAppSynchronize(kPrefDom);
 }
-static CGFloat gIconY = 128;   // distance of the lock icon centre from the screen bottom
-static void PFLoadIconY(void) {
-    id v = PFPrefGet(@"iconY");
-    CGFloat y = v ? [v floatValue] : 128;
-    gIconY = MAX(40, MIN(500, y));
+static CGFloat gIconYPct = 19, gIconXPct = 0;   // icon centre: % of screen height above the bottom, and -100..100 left/right
+static BOOL gHideOnPasscode = YES;
+static void PFLoadIconPos(void) {
+    id y = PFPrefGet(@"iconYPct"), x = PFPrefGet(@"iconX"), h = PFPrefGet(@"hideOnPasscode");
+    gIconYPct = y ? MAX(3, MIN(97, [y floatValue])) : 19;
+    gIconXPct = x ? MAX(-100, MIN(100, [x floatValue])) : 0;
+    gHideOnPasscode = h ? [h boolValue] : YES;
+}
+static CGPoint PFIconCenter(CGSize sz) {
+    CGFloat v = gIconXPct; if (fabs(v) < 6) v = 0;               // snap to the middle
+    CGFloat cx = sz.width / 2 + v / 100.0 * (sz.width / 2 - 30);
+    CGFloat cy = sz.height * (1 - gIconYPct / 100.0);
+    cy = MAX(40, MIN(sz.height - 40, cy));                         // always fully on screen
+    return CGPointMake(cx, cy);
 }
 static NSString *PFDBPath(void) { return [kDir stringByAppendingPathComponent:@"db.bin"]; }
 static void PFRefreshStatus(void) {
@@ -669,10 +678,11 @@ typedef NS_ENUM(int, PFIconState) { PFIconLocked, PFIconScanning, PFIconUnlocked
 + (void)setState:(PFIconState)s;
 + (void)attachTo:(UIView *)host refresh:(BOOL)refresh;
 + (void)reload;
++ (void)watch:(BOOL)on host:(UIView *)host;
 @end
 
 @implementation PFLockIcon {
-    UIImageView *_face, *_lock; PFIconState _state; int _gen;
+    UIImageView *_face, *_lock; PFIconState _state; int _gen; BOOL _pcHidden;
 }
 + (instancetype)shared {
     static PFLockIcon *i; static dispatch_once_t o;
@@ -746,16 +756,50 @@ static UIImage *PFSym(NSString *n, CGFloat pt) {
     if (i.superview != host) { [i removeFromSuperview]; [host addSubview:i]; }
     [host bringSubviewToFront:i];
     CGSize sz = host.bounds.size;
-    i.center = CGPointMake(sz.width / 2, sz.height - gIconY);
+    i.center = PFIconCenter(sz);
     if (refresh) [i refresh];
 }
 + (void)reload {
     dispatch_async(dispatch_get_main_queue(), ^{
-        PFLoadIconY();
+        PFLoadIconPos();
         PFLockIcon *i = [PFLockIcon shared];
         [i refresh];
-        if (i.superview) i.center = CGPointMake(i.superview.bounds.size.width / 2, i.superview.bounds.size.height - gIconY);
+        if (i.superview) i.center = PFIconCenter(i.superview.bounds.size);
     });
+}
+
+// ---- hide the icon while the passcode keypad is on screen ----
+static BOOL PFFindPasscode(UIView *v, UIView *host, CGFloat acc, NSString **name) {
+    if ([v isKindOfClass:PFLockIcon.class] || v.hidden) return NO;
+    acc *= v.alpha;
+    if (acc < 0.1) return NO;
+    NSString *cn = NSStringFromClass(v.class);
+    if ([cn rangeOfString:@"Passcode" options:NSCaseInsensitiveSearch].location != NSNotFound) {
+        CGRect r = [v convertRect:v.bounds toView:host];
+        if (r.size.width > 150 && r.size.height > 150 && CGRectIntersectsRect(host.bounds, CGRectInset(r, 20, 20))) { if (name) *name = cn; return YES; }
+    }
+    for (UIView *sv in v.subviews) if (PFFindPasscode(sv, host, acc, name)) return YES;
+    return NO;
+}
+- (void)updatePasscodeVisibility:(UIView *)host {
+    NSString *name = nil;
+    BOOL pc = gHideOnPasscode && PFFindPasscode(host, host, 1, &name);
+    if (pc == _pcHidden) return;
+    _pcHidden = pc;
+    PFLog(@"icon: passcode screen %@ %@", pc ? @"visible, hiding icon" : @"gone, showing icon", name ?: @"");
+    [UIView animateWithDuration:0.15 animations:^{ self.alpha = pc ? 0 : 1; }];
+}
++ (void)watch:(BOOL)on host:(UIView *)host {
+    static NSTimer *t;
+    [t invalidate]; t = nil;
+    PFLockIcon *i = [PFLockIcon shared];
+    if (!on) return;
+    i->_pcHidden = NO; i.alpha = 1;
+    __weak UIView *wh = host;
+    t = [NSTimer scheduledTimerWithTimeInterval:0.2 repeats:YES block:^(NSTimer *tm) {
+        UIView *h = wh; if (!h) { [tm invalidate]; return; }
+        [i updatePasscodeVisibility:h];
+    }];
 }
 @end
 
@@ -848,7 +892,8 @@ static void PFRetry(void) {
 }
 
 %hook CSCoverSheetViewController
-- (void)viewWillAppear:(BOOL)a { %orig; [PFLockIcon attachTo:self.view refresh:YES]; }
+- (void)viewWillAppear:(BOOL)a { %orig; [PFLockIcon attachTo:self.view refresh:YES]; [PFLockIcon watch:YES host:self.view]; }
+- (void)viewDidDisappear:(BOOL)a { %orig; [PFLockIcon watch:NO host:nil]; }
 - (void)viewDidLayoutSubviews { %orig; [PFLockIcon attachTo:self.view refresh:NO]; }
 %end
 
@@ -862,7 +907,7 @@ static void PFRetry(void) {
 %ctor {
     @autoreleasepool {
         %init;
-        PFLoadIconY();
+        PFLoadIconPos();
         static int t5;
         notify_register_dispatch("com.photoface.prefschanged", &t5, dispatch_get_main_queue(), ^(int t) { [PFLockIcon reload]; });
         static int t1, t2, t3;
