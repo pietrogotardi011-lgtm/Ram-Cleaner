@@ -11,13 +11,17 @@
   <key>key</key><string>enabled</string>
   <key>default</key><true/></dict>
 
- <dict><key>cell</key><string>PSGroupCell</string><key>label</key><string>Face Data</string></dict>
+ <dict><key>cell</key><string>PSGroupCell</string><key>label</key><string>Face Data</string>
+  <key>footerText</key><string>Set Up takes you to the Home Screen and shows a circle like Face ID setup: look at the camera, then slowly move your head in a circle. Use Test Recognition to see live match scores.</string></dict>
  <dict><key>cell</key><string>PSTitleValueCell</string>
   <key>label</key><string>Status</string>
   <key>get</key><string>statusText:</string></dict>
  <dict><key>cell</key><string>PSButtonCell</string>
   <key>label</key><string>Set Up / Re-enroll Face…</string>
   <key>action</key><string>enroll:</string></dict>
+ <dict><key>cell</key><string>PSButtonCell</string>
+  <key>label</key><string>Test Recognition…</string>
+  <key>action</key><string>testRecognition:</string></dict>
  <dict><key>cell</key><string>PSButtonCell</string>
   <key>label</key><string>Remove Face Data</string>
   <key>action</key><string>clearData:</string></dict>
