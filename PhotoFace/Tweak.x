@@ -159,7 +159,7 @@ static float PFLimit(NSDictionary *db) {
     float base = db[@"base"] ? [db[@"base"] floatValue] : [db[@"th"] floatValue] / 1.25f;
     id tv = PFPrefGet(@"tolerance");
     float tol = tv ? [tv floatValue] : 1.25f;
-    if (tol < 1.0f || tol > 2.0f) tol = 1.25f;
+    if (tol < 0.5f || tol > 2.0f) tol = 1.25f;
     return base * tol;
 }
 

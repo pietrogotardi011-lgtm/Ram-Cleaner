@@ -33,12 +33,12 @@
 
  <dict><key>cell</key><string>PSGroupCell</string>
   <key>label</key><string>Tolerance</string>
-  <key>footerText</key><string>Raise it if PhotoFace often fails to recognise you. Lower it if you want it stricter.</string></dict>
+  <key>footerText</key><string>Raise it if PhotoFace often fails to recognise you. Lower it (down to 0.5) if you want it stricter. The limit = your enrolled baseline x this value; use Test Recognition to see the numbers.</string></dict>
  <dict><key>cell</key><string>PSSliderCell</string>
   <key>defaults</key><string>com.photoface.tweak</string>
   <key>key</key><string>tolerance</string>
   <key>default</key><real>1.25</real>
-  <key>min</key><real>1.0</real>
+  <key>min</key><real>0.5</real>
   <key>max</key><real>2.0</real>
   <key>showValue</key><true/></dict>
 </array></dict></plist>
