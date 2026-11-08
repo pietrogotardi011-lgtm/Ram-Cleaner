@@ -13,6 +13,8 @@
 @interface SBLockScreenManager : NSObject
 + (instancetype)sharedInstance;
 - (BOOL)isUIUnlocked;
+- (BOOL)isUILocked;
+- (BOOL)isLockScreenVisible;
 - (void)_attemptUnlockWithPasscode:(NSString *)p mesa:(BOOL)m finishUIUnlock:(BOOL)f completion:(id)c;
 - (void)attemptUnlockWithPasscode:(NSString *)p finishUIUnlock:(BOOL)f completion:(id)c;
 - (BOOL)attemptUnlockWithPasscode:(NSString *)p;
@@ -57,6 +59,10 @@ static void PFLog(NSString *fmt, ...) {
     if (!h) { [line writeToFile:p atomically:YES encoding:NSUTF8StringEncoding error:nil]; return; }
     [h seekToEndOfFile]; [h writeData:[line dataUsingEncoding:NSUTF8StringEncoding]]; [h closeFile];
 }
+static NSString *PFGuardPath(void) { return [kDir stringByAppendingPathComponent:@"guard"]; }
+static void PFGuardBegin(void) { [@"1" writeToFile:PFGuardPath() atomically:NO encoding:NSUTF8StringEncoding error:nil]; }
+static void PFGuardEnd(void) { [[NSFileManager defaultManager] removeItemAtPath:PFGuardPath() error:nil]; }
+
 static NSDictionary *PFQ(void) {
     return @{(id)kSecClass: (id)kSecClassGenericPassword,
              (id)kSecAttrService: kService, (id)kSecAttrAccount: @"pw"};
@@ -113,7 +119,7 @@ static float PFLimit(NSDictionary *db) {
     int _frames, _hits, _center, _secCount[8];
     NSMutableArray *_got; NSMutableArray<NSNumber *> *_bins;
     NSDictionary *_db; void (^_done)(BOOL, NSString *);
-    NSString *_interrupt; BOOL _observing;
+    NSString *_interrupt; BOOL _observing, _retried; dispatch_queue_t _cfg;
 }
 @synthesize session = _s;
 
@@ -121,6 +127,7 @@ static float PFLimit(NSDictionary *db) {
     static PFScanner *i; static dispatch_once_t o;
     dispatch_once(&o, ^{ i = [PFScanner new];
         i->_q = dispatch_queue_create("photoface.cam", DISPATCH_QUEUE_SERIAL);
+        i->_cfg = dispatch_queue_create("photoface.cfg", DISPATCH_QUEUE_SERIAL);
         i->_ci = [CIContext contextWithOptions:nil]; });
     return i;
 }
@@ -191,10 +198,12 @@ static float PFLimit(NSDictionary *db) {
     _frames = 0; _interrupt = nil; _lastProc = 0;
     _startTS = CACurrentMediaTime(); _lastFrameTS = _startTS; _lastGain = _startTS;
     _deadlineTS = _startTS + t;
+    _retried = NO;
+    PFGuardBegin();
     NSString *err = [self build];
     self.mode = mode;
     if (err) { [self finish:NO info:err]; return; }
-    dispatch_async(_q, ^{ [self->_s startRunning]; });
+    dispatch_async(_cfg, ^{ [self->_s startRunning]; PFLog(@"startRunning returned, running=%d", self->_s.isRunning); });
     [_wd invalidate];
     _wd = [NSTimer scheduledTimerWithTimeInterval:0.5 target:self selector:@selector(tick) userInfo:nil repeats:YES];
 }
@@ -202,9 +211,16 @@ static float PFLimit(NSDictionary *db) {
 - (void)tick {
     if (!self.mode) return;
     NSTimeInterval n = CACurrentMediaTime();
-    if (_frames == 0 && n - _startTS > 5) {
-        [self finish:NO info:[NSString stringWithFormat:@"the camera isn't delivering frames%@",
-                              _interrupt ? [NSString stringWithFormat:@" (%@)", _interrupt] : @""]];
+    if (_frames == 0 && n - _startTS > 2.5 && !_retried) {
+        _retried = YES;
+        PFLog(@"no frames after 2.5s (running=%d interrupted=%d) - restarting session", _s.isRunning, _s.isInterrupted);
+        AVCaptureSession *rs = _s;
+        dispatch_async(_cfg, ^{ [rs stopRunning]; [rs startRunning]; });
+    }
+    if (_frames == 0 && n - _startTS > 6) {
+        [self finish:NO info:[NSString stringWithFormat:@"the camera isn't delivering frames (session running: %@, interrupted: %@%@)",
+                              _s.isRunning ? @"yes" : @"no", _s.isInterrupted ? @"yes" : @"no",
+                              _interrupt ? [NSString stringWithFormat:@", %@", _interrupt] : @""]];
         return;
     }
     if (_frames > 0 && n - _lastFrameTS > 3) {
@@ -227,7 +243,8 @@ static float PFLimit(NSDictionary *db) {
     dispatch_async(dispatch_get_main_queue(), ^{ [w invalidate]; });
     PFLog(@"finish ok=%d info=%@ frames=%d", ok, info, _frames);
     AVCaptureSession *s = _s;
-    dispatch_async(dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{ [s stopRunning]; });
+    PFGuardEnd();
+    dispatch_async(_cfg, ^{ [s stopRunning]; });
     void (^d)(BOOL, NSString *) = _done; _done = nil;
     dispatch_async(dispatch_get_main_queue(), ^{ if (d) d(ok, info); });
 }
@@ -537,21 +554,39 @@ static void PFUnlock(NSString *pw) {
         [m attemptUnlockWithPasscode:pw];
 }
 
-static void PFWake(void) {
+static BOOL PFIsLocked(void) {
     SBLockScreenManager *m = [%c(SBLockScreenManager) sharedInstance];
-    if ([m isUIUnlocked]) { gFails = 0; return; }
+    if (!m) return NO;
+    if ([m respondsToSelector:@selector(isUILocked)]) return [m isUILocked];
+    if ([m respondsToSelector:@selector(isUIUnlocked)]) return ![m isUIUnlocked];
+    if ([m respondsToSelector:@selector(isLockScreenVisible)]) return [m isLockScreenVisible];
+    return NO;
+}
+
+static void PFWakeInner(void) {
+    if (!PFIsLocked()) { gFails = 0; return; }
     id en = PFPrefGet(@"enabled");
     if (en && ![en boolValue]) return;      // master switch
     if (gFails >= 3) return;
     NSString *pw = PFLoadPW(); // nil before first unlock after boot -> passcode required, like Touch ID
     if (!pw || ![[NSFileManager defaultManager] fileExistsAtPath:PFDBPath()]) return;
     [[PFScanner shared] start:1 timeout:6 done:^(BOOL ok, NSString *i) {
-        if (!ok || [m isUIUnlocked]) return;
-        PFUnlock(pw);
+        if (!ok || !PFIsLocked()) return;
+        @try { PFUnlock(pw); } @catch (NSException *e) { PFLog(@"unlock exception: %@", e); }
         dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 1500 * NSEC_PER_MSEC), dispatch_get_main_queue(), ^{
-            if (![m isUIUnlocked]) gFails++;
+            if (PFIsLocked()) gFails++;
         });
     }];
+}
+
+static void PFWake(void) {
+    static CFTimeInterval last;
+    CFTimeInterval now = CACurrentMediaTime();
+    if (now - last < 1.5) return;   // wake can be signalled twice
+    last = now;
+    PFGuardBegin();
+    @try { PFWakeInner(); } @catch (NSException *e) { PFLog(@"wake exception: %@", e); }
+    if (![PFScanner shared].mode) PFGuardEnd();
 }
 
 %hook SBBacklightController
@@ -589,8 +624,20 @@ static void PFWake(void) {
             SecItemDelete((__bridge CFDictionaryRef)PFQ());
             PFPrefSet(@"status", @"Not enrolled");
         });
+        static int t4;
+        notify_register_dispatch("com.apple.springboard.hasBlankedScreen", &t4, dispatch_get_main_queue(), ^(int t) {
+            uint64_t st = 1; notify_get_state(t, &st);
+            if (st == 0) PFWake();
+        });
         PFPrefSet(@"pendingPasscode", nil);
-        PFRefreshStatus();
+        if ([[NSFileManager defaultManager] fileExistsAtPath:PFGuardPath()]) {
+            PFGuardEnd();
+            PFPrefSet(@"enabled", @NO);
+            PFPrefSet(@"status", @"Switched off: SpringBoard crashed while PhotoFace was running");
+            PFLog(@"crash guard tripped: previous run did not finish; tweak switched off");
+        } else {
+            PFRefreshStatus();
+        }
         PFLog(@"PhotoFace loaded in SpringBoard");
     }
 }
