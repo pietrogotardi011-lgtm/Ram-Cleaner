@@ -9,6 +9,8 @@
 #import <float.h>
 #import <math.h>
 #import <sys/stat.h>
+#import <objc/runtime.h>
+#import <objc/message.h>
 
 @interface SBLockScreenManager : NSObject
 + (instancetype)sharedInstance;
@@ -59,6 +61,50 @@ static void PFLog(NSString *fmt, ...) {
     if (!h) { [line writeToFile:p atomically:YES encoding:NSUTF8StringEncoding error:nil]; chmod(p.fileSystemRepresentation, 0600); return; }
     [h seekToEndOfFile]; [h writeData:[line dataUsingEncoding:NSUTF8StringEncoding]]; [h closeFile];
     chmod(p.fileSystemRepresentation, 0600);
+}
+
+// ---- diagnostics: who is in front, and what camera "background" switches exist ----
+static NSString *PFFrontApp(void) {
+    @try {
+        id app = [UIApplication sharedApplication];
+        SEL sel = NSSelectorFromString(@"_accessibilityFrontMostApplication");
+        if (![app respondsToSelector:sel]) return @"(selector missing)";
+        id fa = ((id (*)(id, SEL))objc_msgSend)(app, sel);
+        if (!fa) return @"(none: SpringBoard/home or lock screen)";
+        id bid = nil;
+        @try { bid = [fa valueForKey:@"bundleIdentifier"]; } @catch (...) {}
+        if (!bid) { @try { bid = [fa valueForKey:@"displayIdentifier"]; } @catch (...) {} }
+        return bid ? [NSString stringWithFormat:@"%@", bid] : @"(unknown app)";
+    } @catch (NSException *e) { return @"(exception)"; }
+}
+static void PFLogEnv(const char *tag) {
+    UIApplication *app = [UIApplication sharedApplication];
+    SBLockScreenManager *lm = [%c(SBLockScreenManager) sharedInstance];
+    int locked = -1;
+    if ([lm respondsToSelector:@selector(isUILocked)]) locked = [lm isUILocked] ? 1 : 0;
+    PFLog(@"env[%s] appState=%ld frontApp=%@ homePressSel=%d locked=%d", tag, (long)app.applicationState, PFFrontApp(),
+          (int)[app respondsToSelector:@selector(_simulateHomeButtonPress)], locked);
+}
+static void PFDumpCameraSwitches(void) {
+    const char *names[] = { "AVCaptureSession", "AVCaptureDevice", "AVCaptureDeviceInput", "AVCaptureVideoDataOutput" };
+    for (int i = 0; i < 4; i++) {
+        Class c = objc_getClass(names[i]);
+        if (!c) continue;
+        NSMutableArray *hits = [NSMutableArray new];
+        for (int meta = 0; meta < 2; meta++) {
+            unsigned n = 0;
+            Method *ms = class_copyMethodList(meta ? object_getClass(c) : c, &n);
+            for (unsigned k = 0; k < n; k++) {
+                NSString *nm = NSStringFromSelector(method_getName(ms[k]));
+                NSString *l = nm.lowercaseString;
+                if ([l containsString:@"background"] || [l containsString:@"foreground"] || [l containsString:@"inuseby"] ||
+                    [l containsString:@"suspend"] || [l containsString:@"interrupt"] || [l containsString:@"multitask"])
+                    [hits addObject:[NSString stringWithFormat:@"%@%@", meta ? @"+" : @"-", nm]];
+            }
+            free(ms);
+        }
+        PFLog(@"camera-api %s: %@", names[i], [hits componentsJoinedByString:@" "]);
+    }
 }
 static NSString *PFGuardPath(void) { return [kDir stringByAppendingPathComponent:@"guard"]; }
 static void PFGuardBegin(void) { [@"1" writeToFile:PFGuardPath() atomically:NO encoding:NSUTF8StringEncoding error:nil]; }
@@ -205,6 +251,7 @@ static float PFLimit(NSDictionary *db) {
     }
     AVAuthorizationStatus st = [AVCaptureDevice authorizationStatusForMediaType:AVMediaTypeVideo];
     PFLog(@"start mode=%d camera-auth=%ld", mode, (long)st);
+    PFLogEnv("start");
     if (st == AVAuthorizationStatusDenied || st == AVAuthorizationStatusRestricted) {
         done(NO, @"camera access is denied for SpringBoard"); return;
     }
@@ -419,6 +466,7 @@ static float PFLimit(NSDictionary *db) {
 
 + (void)begin:(int)mode {
     id app = [UIApplication sharedApplication];
+    PFLogEnv("before-home");
     if ([app respondsToSelector:@selector(_simulateHomeButtonPress)]) [(SpringBoard *)app _simulateHomeButtonPress];
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 700 * NSEC_PER_MSEC), dispatch_get_main_queue(), ^{
         [[PFSetup shared] present:mode];
@@ -612,10 +660,12 @@ static BOOL PFIsLocked(void) {
 static void PFWakeInner(void) {
     if (!PFIsLocked()) { gFails = 0; return; }
     id en = PFPrefGet(@"enabled");
-    if (en && ![en boolValue]) return;      // master switch
-    if (gFails >= 3) return;
+    if (en && ![en boolValue]) { PFLog(@"wake: skipped, tweak switched off"); return; }      // master switch
+    if (gFails >= 3) { PFLog(@"wake: skipped, locked out after %d fails", gFails); return; }
     NSString *pw = PFLoadPW(); // nil before first unlock after boot -> passcode required, like Touch ID
-    if (!pw || ![[NSFileManager defaultManager] fileExistsAtPath:PFDBPath()]) return;
+    BOOL hasDB = [[NSFileManager defaultManager] fileExistsAtPath:PFDBPath()];
+    if (!pw || !hasDB) { PFLog(@"wake: skipped, passcode stored=%d face enrolled=%d", pw != nil, hasDB); return; }
+    PFLogEnv("wake");
     [[PFScanner shared] start:1 timeout:6 done:^(BOOL ok, NSString *i) {
         if (!ok) {
             if ([PFScanner shared].sawMismatch) { gFails++; PFLog(@"face seen but not matched (fails=%d)", gFails); }
@@ -689,5 +739,6 @@ static void PFWake(void) {
             PFRefreshStatus();
         }
         PFLog(@"PhotoFace loaded in SpringBoard");
+        PFDumpCameraSwitches();
     }
 }
