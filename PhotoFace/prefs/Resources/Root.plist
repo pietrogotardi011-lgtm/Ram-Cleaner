@@ -10,6 +10,11 @@
   <key>defaults</key><string>com.photoface.tweak</string>
   <key>key</key><string>enabled</string>
   <key>default</key><true/></dict>
+ <dict><key>cell</key><string>PSSwitchCell</string>
+  <key>label</key><string>Lock Screen Icon</string>
+  <key>defaults</key><string>com.photoface.tweak</string>
+  <key>key</key><string>showIcon</string>
+  <key>default</key><true/></dict>
 
  <dict><key>cell</key><string>PSGroupCell</string><key>label</key><string>Face Data</string>
   <key>footerText</key><string>Set Up takes you to the Home Screen and shows a circle like Face ID setup: look at the camera, then slowly move your head in a circle. Use Test Recognition to see live match scores.</string></dict>

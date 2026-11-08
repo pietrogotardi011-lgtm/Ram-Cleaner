@@ -137,9 +137,23 @@ static void PFStatus(NSString *s) {   // status file for the pfenroll CLI
 static NSDictionary *PFLoadDB(void) {
     NSData *d = [NSData dataWithContentsOfFile:PFDBPath()];
     if (!d) return nil;
-    NSSet *cls = [NSSet setWithObjects:NSDictionary.class, NSArray.class, NSNumber.class,
-                  VNFeaturePrintObservation.class, nil];
-    return [NSKeyedUnarchiver unarchivedObjectOfClasses:cls fromData:d error:nil];
+    // NSString/NSData/NSNull must be allowed too: dictionary keys are NSStrings, and a secure
+    // unarchive that doesn't list them fails, which made verify + test think nothing was enrolled.
+    NSSet *cls = [NSSet setWithObjects:NSDictionary.class, NSArray.class, NSNumber.class, NSString.class,
+                  NSData.class, NSNull.class, VNFeaturePrintObservation.class, nil];
+    NSError *err = nil;
+    NSDictionary *r = [NSKeyedUnarchiver unarchivedObjectOfClasses:cls fromData:d error:&err];
+    if (!r) {
+        PFLog(@"PFLoadDB secure unarchive failed: %@ - trying non-secure fallback", err);
+        @try {
+            NSKeyedUnarchiver *u = [[NSKeyedUnarchiver alloc] initForReadingFromData:d error:nil];
+            u.requiresSecureCoding = NO;
+            r = [u decodeObjectForKey:NSKeyedArchiveRootObjectKey];
+            [u finishDecoding];
+        } @catch (NSException *e) { PFLog(@"PFLoadDB fallback exception: %@", e); r = nil; }
+    }
+    if (![r isKindOfClass:NSDictionary.class] || ![r[@"prints"] count]) { PFLog(@"PFLoadDB: face data unreadable"); return nil; }
+    return r;
 }
 static float PFLimit(NSDictionary *db) {
     float base = db[@"base"] ? [db[@"base"] floatValue] : [db[@"th"] floatValue] / 1.25f;
@@ -636,16 +650,122 @@ static UIColor *PFGreen(void) { return [UIColor colorWithRed:0.19 green:0.82 blu
 }
 @end
 
+#pragma mark - lock screen icon
+
+typedef NS_ENUM(int, PFIconState) { PFIconLocked, PFIconScanning, PFIconUnlocked, PFIconFailed };
+
+@interface CSCoverSheetViewController : UIViewController
+@end
+
+@interface PFLockIcon : UIView
++ (instancetype)shared;
++ (void)setState:(PFIconState)s;
++ (void)attachTo:(UIView *)host refresh:(BOOL)refresh;
+@end
+
+@implementation PFLockIcon {
+    UIImageView *_face, *_lock; PFIconState _state; int _gen;
+}
++ (instancetype)shared {
+    static PFLockIcon *i; static dispatch_once_t o;
+    dispatch_once(&o, ^{ i = [[PFLockIcon alloc] initWithFrame:CGRectMake(0, 0, 48, 64)]; });
+    return i;
+}
+static UIImage *PFSym(NSString *n, CGFloat pt) {
+    UIImageSymbolConfiguration *c = [UIImageSymbolConfiguration configurationWithPointSize:pt weight:UIImageSymbolWeightLight];
+    return [[UIImage systemImageNamed:n withConfiguration:c] imageWithRenderingMode:UIImageRenderingModeAlwaysTemplate];
+}
+- (instancetype)initWithFrame:(CGRect)f {
+    if (!(self = [super initWithFrame:f])) return nil;
+    self.userInteractionEnabled = NO;
+    _face = [[UIImageView alloc] initWithFrame:CGRectMake(4, 0, 40, 40)];
+    _face.contentMode = UIViewContentModeScaleAspectFit;
+    _lock = [[UIImageView alloc] initWithFrame:CGRectMake(15, 43, 18, 20)];
+    _lock.contentMode = UIViewContentModeScaleAspectFit;
+    for (UIView *v in @[_face, _lock]) {
+        v.layer.shadowColor = UIColor.blackColor.CGColor; v.layer.shadowOpacity = 0.45;
+        v.layer.shadowRadius = 3; v.layer.shadowOffset = CGSizeZero;
+        [self addSubview:v];
+    }
+    [self apply:PFIconLocked];
+    return self;
+}
+- (void)apply:(PFIconState)s {
+    _state = s;
+    [self.layer removeAllAnimations]; [_face.layer removeAllAnimations];
+    UIColor *c = UIColor.whiteColor; NSString *lock = @"lock.fill";
+    switch (s) {
+        case PFIconLocked:   c = [UIColor colorWithWhite:1 alpha:0.9]; break;
+        case PFIconScanning: c = UIColor.whiteColor; break;
+        case PFIconUnlocked: c = PFGreen(); lock = @"lock.open.fill"; break;
+        case PFIconFailed:   c = [UIColor colorWithRed:1 green:0.35 blue:0.3 alpha:1]; break;
+    }
+    _face.image = PFSym(@"faceid", 34);
+    _lock.image = PFSym(lock, 15);
+    _face.tintColor = c; _lock.tintColor = c;
+    _face.alpha = 1;
+    if (s == PFIconScanning) {
+        CABasicAnimation *a = [CABasicAnimation animationWithKeyPath:@"opacity"];
+        a.fromValue = @1; a.toValue = @0.3; a.duration = 0.7; a.autoreverses = YES; a.repeatCount = HUGE_VALF;
+        [_face.layer addAnimation:a forKey:@"pulse"];
+    } else if (s == PFIconFailed) {
+        CAKeyframeAnimation *k = [CAKeyframeAnimation animationWithKeyPath:@"transform.translation.x"];
+        k.values = @[@0, @-8, @8, @-6, @6, @0]; k.duration = 0.4;
+        [self.layer addAnimation:k forKey:@"shake"];
+    }
+}
+- (void)refresh {
+    id en = PFPrefGet(@"enabled"), si = PFPrefGet(@"showIcon");
+    self.hidden = (en && ![en boolValue]) || (si && ![si boolValue]);
+}
++ (void)setState:(PFIconState)s {
+    dispatch_async(dispatch_get_main_queue(), ^{
+        PFLockIcon *i = [PFLockIcon shared];
+        int g = ++i->_gen;
+        [i apply:s];
+        if (s == PFIconFailed)   // fall back to the plain locked look after a moment
+            dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 1300 * NSEC_PER_MSEC), dispatch_get_main_queue(), ^{
+                if (i->_gen == g) [i apply:PFIconLocked];
+            });
+    });
+}
++ (void)attachTo:(UIView *)host refresh:(BOOL)refresh {
+    if (!host) return;
+    PFLockIcon *i = [PFLockIcon shared];
+    if (i.superview != host) { [i removeFromSuperview]; [host addSubview:i]; }
+    [host bringSubviewToFront:i];
+    CGSize sz = host.bounds.size;
+    i.center = CGPointMake(sz.width / 2, sz.height - 128);   // just above the "Press home to unlock" text
+    if (refresh) [i refresh];
+}
+@end
+
 #pragma mark - unlock logic
 
+static BOOL PFIsLocked(void);
 static void PFUnlock(NSString *pw) {
     SBLockScreenManager *m = [%c(SBLockScreenManager) sharedInstance];
-    if ([m respondsToSelector:@selector(_attemptUnlockWithPasscode:mesa:finishUIUnlock:completion:)])
-        [m _attemptUnlockWithPasscode:pw mesa:NO finishUIUnlock:YES completion:nil];
-    else if ([m respondsToSelector:@selector(attemptUnlockWithPasscode:finishUIUnlock:completion:)])
-        [m attemptUnlockWithPasscode:pw finishUIUnlock:YES completion:nil];
-    else if ([m respondsToSelector:@selector(attemptUnlockWithPasscode:)])
-        [m attemptUnlockWithPasscode:pw];
+    NSString *how = @"none";
+    if ([m respondsToSelector:@selector(_attemptUnlockWithPasscode:mesa:finishUIUnlock:completion:)]) {
+        [m _attemptUnlockWithPasscode:pw mesa:NO finishUIUnlock:YES completion:nil]; how = @"_attemptUnlockWithPasscode:mesa:";
+    } else if ([m respondsToSelector:@selector(attemptUnlockWithPasscode:finishUIUnlock:completion:)]) {
+        [m attemptUnlockWithPasscode:pw finishUIUnlock:YES completion:nil]; how = @"attemptUnlockWithPasscode:finishUIUnlock:completion:";
+    } else if ([m respondsToSelector:@selector(attemptUnlockWithPasscode:)]) {
+        [m attemptUnlockWithPasscode:pw]; how = @"attemptUnlockWithPasscode:";
+    }
+    PFLog(@"unlock: authenticated via %@", how);
+    // Authenticating does not always dismiss the lock UI -> push it through to the home screen.
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 450 * NSEC_PER_MSEC), dispatch_get_main_queue(), ^{
+        if (!PFIsLocked()) { PFLog(@"unlock: lock UI dismissed"); return; }
+        SBLockScreenManager *mm = [%c(SBLockScreenManager) sharedInstance];
+        SEL u = NSSelectorFromString(@"unlockUIFromSource:withOptions:");
+        if ([mm respondsToSelector:u]) { ((void (*)(id, SEL, int, id))objc_msgSend)(mm, u, 0, nil); PFLog(@"unlock: unlockUIFromSource sent"); }
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 700 * NSEC_PER_MSEC), dispatch_get_main_queue(), ^{
+            if (!PFIsLocked()) { PFLog(@"unlock: lock UI dismissed (2)"); return; }
+            id app = [UIApplication sharedApplication];
+            if ([app respondsToSelector:@selector(_simulateHomeButtonPress)]) { [(SpringBoard *)app _simulateHomeButtonPress]; PFLog(@"unlock: home press sent"); }
+        });
+    });
 }
 
 static BOOL PFIsLocked(void) {
@@ -666,15 +786,24 @@ static void PFWakeInner(void) {
     BOOL hasDB = [[NSFileManager defaultManager] fileExistsAtPath:PFDBPath()];
     if (!pw || !hasDB) { PFLog(@"wake: skipped, passcode stored=%d face enrolled=%d", pw != nil, hasDB); return; }
     PFLogEnv("wake");
+    [PFLockIcon setState:PFIconScanning];
     [[PFScanner shared] start:1 timeout:6 done:^(BOOL ok, NSString *i) {
         if (!ok) {
-            if ([PFScanner shared].sawMismatch) { gFails++; PFLog(@"face seen but not matched (fails=%d)", gFails); }
+            BOOL seen = [PFScanner shared].sawMismatch;
+            if (seen) { gFails++; PFLog(@"face seen but not matched (fails=%d)", gFails); }
+            else PFLog(@"verify ended without a match: %@", i);
+            [PFLockIcon setState:seen ? PFIconFailed : PFIconLocked];
             return;
         }
+        [PFLockIcon setState:PFIconUnlocked];
         if (!PFIsLocked()) return;
-        @try { PFUnlock(pw); } @catch (NSException *e) { PFLog(@"unlock exception: %@", e); }
-        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 1500 * NSEC_PER_MSEC), dispatch_get_main_queue(), ^{
-            if (PFIsLocked()) gFails++;
+        // brief pause so the open padlock is visible, like Face ID
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 300 * NSEC_PER_MSEC), dispatch_get_main_queue(), ^{
+            if (!PFIsLocked()) return;
+            @try { PFUnlock(pw); } @catch (NSException *e) { PFLog(@"unlock exception: %@", e); }
+            dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 2500 * NSEC_PER_MSEC), dispatch_get_main_queue(), ^{
+                if (PFIsLocked()) { gFails++; [PFLockIcon setState:PFIconFailed]; PFLog(@"still locked after unlock attempt (fails=%d)", gFails); }
+            });
         });
     }];
 }
@@ -689,6 +818,11 @@ static void PFWake(void) {
     if (![PFScanner shared].mode) PFGuardEnd();
 }
 
+%hook CSCoverSheetViewController
+- (void)viewWillAppear:(BOOL)a { %orig; [PFLockIcon attachTo:self.view refresh:YES]; }
+- (void)viewDidLayoutSubviews { %orig; [PFLockIcon attachTo:self.view refresh:NO]; }
+%end
+
 %hook SBBacklightController
 - (void)turnOnScreenFullyWithBacklightSource:(long long)source {
     %orig;
@@ -698,6 +832,7 @@ static void PFWake(void) {
 
 %ctor {
     @autoreleasepool {
+        %init;
         static int t1, t2, t3;
         notify_register_dispatch("com.photoface.enroll", &t1, dispatch_get_main_queue(), ^(int t) {
             NSString *p = [kDir stringByAppendingPathComponent:@"passcode.tmp"];
@@ -727,7 +862,7 @@ static void PFWake(void) {
         static int t4;
         notify_register_dispatch("com.apple.springboard.hasBlankedScreen", &t4, dispatch_get_main_queue(), ^(int t) {
             uint64_t st = 1; notify_get_state(t, &st);
-            if (st == 0) PFWake();
+            if (st == 0) PFWake(); else [PFLockIcon setState:PFIconLocked];
         });
         PFPrefSet(@"pendingPasscode", nil);
         if ([[NSFileManager defaultManager] fileExistsAtPath:PFGuardPath()]) {
