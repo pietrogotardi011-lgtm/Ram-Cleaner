@@ -1,0 +1,30 @@
+name: Build PhotoFace deb
+on:
+  push:
+    paths: ["PhotoFace/**", ".github/workflows/photoface.yml"]
+  workflow_dispatch:
+permissions:
+  contents: write
+jobs:
+  build:
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v4
+      - run: brew install ldid dpkg make xz
+      - run: git clone --recursive https://github.com/theos/theos.git $HOME/theos
+      - name: Build
+        working-directory: PhotoFace
+        run: |
+          export THEOS=$HOME/theos
+          export PATH="$(brew --prefix make)/libexec/gnubin:$PATH"
+          make package FINALPACKAGE=1
+      - uses: actions/upload-artifact@v4
+        with:
+          name: PhotoFace-deb
+          path: PhotoFace/packages/*.deb
+      - name: Publish release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release delete photoface-latest --yes --cleanup-tag 2>/dev/null || true
+          gh release create photoface-latest PhotoFace/packages/*.deb --title "PhotoFace (latest)" --notes "Auto-built .deb"
