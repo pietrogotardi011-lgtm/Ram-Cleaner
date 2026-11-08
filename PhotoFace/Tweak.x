@@ -6,6 +6,7 @@
 #import <Security/Security.h>
 #import <notify.h>
 #import <float.h>
+#import <sys/stat.h>
 
 @interface SBLockScreenManager : NSObject
 + (instancetype)sharedInstance;
