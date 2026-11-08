@@ -151,16 +151,18 @@ static float PFLimit(NSDictionary *db) {
     NSNotificationCenter *nc = [NSNotificationCenter defaultCenter];
     [nc addObserverForName:AVCaptureSessionRuntimeErrorNotification object:s queue:nil usingBlock:^(NSNotification *n) {
         NSError *er = n.userInfo[AVCaptureSessionErrorKey];
-        ws->_interrupt = er.localizedDescription ?: @"camera runtime error";
+        PFScanner *st = ws; if (!st) return;
+        st->_interrupt = er.localizedDescription ?: @"camera runtime error";
         PFLog(@"runtime error: %@", er);
     }];
     [nc addObserverForName:AVCaptureSessionWasInterruptedNotification object:s queue:nil usingBlock:^(NSNotification *n) {
         long r = [n.userInfo[AVCaptureSessionInterruptionReasonKey] longValue];
-        ws->_interrupt = [NSString stringWithFormat:@"camera interrupted (reason %ld)", r];
+        PFScanner *st = ws; if (!st) return;
+        st->_interrupt = [NSString stringWithFormat:@"camera interrupted (reason %ld)", r];
         PFLog(@"interrupted reason=%ld", r);
     }];
     [nc addObserverForName:AVCaptureSessionInterruptionEndedNotification object:s queue:nil usingBlock:^(NSNotification *n) {
-        ws->_interrupt = nil;
+        PFScanner *st = ws; if (st) st->_interrupt = nil;
     }];
     return nil;
 }
