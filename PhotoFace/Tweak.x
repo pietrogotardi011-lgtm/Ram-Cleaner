@@ -45,18 +45,23 @@ static void PFPrefSet(NSString *k, id v) {
     CFPreferencesAppSynchronize(kPrefDom);
 }
 static CGFloat gIconYPct = 19, gIconXPct = 0;   // icon centre: % of screen height above the bottom, and -100..100 left/right
-static BOOL gHideOnPasscode = YES;
+static BOOL gHideOnPasscode = YES, gEarlyTrigger = YES;
+static int gStartDelayMs = 80, gConfirmFrames = 2;
 static void PFLoadIconPos(void) {
     id y = PFPrefGet(@"iconYPct"), x = PFPrefGet(@"iconX"), h = PFPrefGet(@"hideOnPasscode");
-    gIconYPct = y ? MAX(3, MIN(97, [y floatValue])) : 19;
+    id sd = PFPrefGet(@"startDelay"), cf = PFPrefGet(@"confirmFrames"), et = PFPrefGet(@"earlyTrigger");
+    gStartDelayMs = sd ? MAX(0, MIN(600, (int)lroundf([sd floatValue]))) : 80;
+    gConfirmFrames = cf ? MAX(1, MIN(4, (int)lroundf([cf floatValue]))) : 2;
+    gEarlyTrigger = et ? [et boolValue] : YES;
+    gIconYPct = y ? MAX(0, MIN(100, [y floatValue])) : 19;
     gIconXPct = x ? MAX(-100, MIN(100, [x floatValue])) : 0;
     gHideOnPasscode = h ? [h boolValue] : YES;
 }
 static CGPoint PFIconCenter(CGSize sz) {
     CGFloat v = gIconXPct; if (fabs(v) < 6) v = 0;               // snap to the middle
-    CGFloat cx = sz.width / 2 + v / 100.0 * (sz.width / 2 - 30);
+    CGFloat cx = sz.width / 2 + v / 100.0 * (sz.width / 2 - 24);
     CGFloat cy = sz.height * (1 - gIconYPct / 100.0);
-    cy = MAX(40, MIN(sz.height - 40, cy));                         // always fully on screen
+    cy = MAX(32, MIN(sz.height - 32, cy));                         // always fully on screen
     return CGPointMake(cx, cy);
 }
 static NSString *PFDBPath(void) { return [kDir stringByAppendingPathComponent:@"db.bin"]; }
@@ -311,7 +316,7 @@ static float PFLimit(NSDictionary *db) {
     AVCaptureSession *s = _s;
     if (!s) return;
     // give the backlight / lock screen a moment to settle before grabbing the camera
-    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 250 * NSEC_PER_MSEC), _cfg, ^{
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)gStartDelayMs * NSEC_PER_MSEC), _cfg, ^{
         if (!self.mode || s != self->_s) return;
         [s startRunning];
         PFLog(@"startRunning returned, running=%d interrupted=%d (try %d)", s.isRunning, s.isInterrupted, self->_retries);
@@ -322,7 +327,7 @@ static float PFLimit(NSDictionary *db) {
     if (!self.mode) return;
     NSTimeInterval n = CACurrentMediaTime();
     // no frames: rebuild a brand-new session (new device input), up to 2 times
-    if (_frames == 0 && _retries < 2 && n - _startTS > 1.8 * (_retries + 1)) {
+    if (_frames == 0 && _retries < 2 && n - _startTS > 1.0 * (_retries + 1)) {
         _retries++;
         PFLog(@"no frames after %.1fs (running=%d interrupted=%d) - rebuilding session (retry %d)",
               n - _startTS, _s.isRunning, _s.isInterrupted, _retries);
@@ -392,7 +397,7 @@ static float PFLimit(NSDictionary *db) {
     _frames++; _lastFrameTS = now;
     int mode = self.mode;
     if (!mode) return;
-    if (now - _lastProc < (mode == 1 ? 0.2 : 0.15)) return;
+    if (now - _lastProc < (mode == 1 ? 0.1 : 0.15)) return;
     _lastProc = now;
     CVPixelBufferRef pb = CMSampleBufferGetImageBuffer(sb);
     if (!pb) return;
@@ -456,7 +461,7 @@ static float PFLimit(NSDictionary *db) {
     if (mode == 3) { [self report:@{@"best": @(best), @"limit": @(limit), @"face": @YES}]; return; }
     if (best < limit) { _hits++; }
     else { _hits = 0; if (mode == 1 && ++_miss >= 3) self.sawMismatch = YES; }
-    if (_hits >= 4) [self finish:YES info:[NSString stringWithFormat:@"match %.2f", best]];
+    if (_hits >= gConfirmFrames) [self finish:YES info:[NSString stringWithFormat:@"match %.2f", best]];
 }
 
 - (void)finalizeEnroll {
@@ -668,6 +673,8 @@ static UIColor *PFGreen(void) { return [UIColor colorWithRed:0.19 green:0.82 blu
 #pragma mark - lock screen icon
 
 static void PFRetry(void);
+static int gBlankTok = 0;
+static BOOL PFScreenOn(void) { uint64_t st = 1; if (gBlankTok) notify_get_state(gBlankTok, &st); return st == 0; }
 typedef NS_ENUM(int, PFIconState) { PFIconLocked, PFIconScanning, PFIconUnlocked, PFIconFailed };
 
 @interface CSCoverSheetViewController : UIViewController
@@ -818,12 +825,12 @@ static void PFUnlock(NSString *pw) {
     }
     PFLog(@"unlock: authenticated via %@", how);
     // Authenticating does not always dismiss the lock UI -> push it through to the home screen.
-    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 450 * NSEC_PER_MSEC), dispatch_get_main_queue(), ^{
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 250 * NSEC_PER_MSEC), dispatch_get_main_queue(), ^{
         if (!PFIsLocked()) { PFLog(@"unlock: lock UI dismissed"); return; }
         SBLockScreenManager *mm = [%c(SBLockScreenManager) sharedInstance];
         SEL u = NSSelectorFromString(@"unlockUIFromSource:withOptions:");
         if ([mm respondsToSelector:u]) { ((void (*)(id, SEL, int, id))objc_msgSend)(mm, u, 0, nil); PFLog(@"unlock: unlockUIFromSource sent"); }
-        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 700 * NSEC_PER_MSEC), dispatch_get_main_queue(), ^{
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 500 * NSEC_PER_MSEC), dispatch_get_main_queue(), ^{
             if (!PFIsLocked()) { PFLog(@"unlock: lock UI dismissed (2)"); return; }
             id app = [UIApplication sharedApplication];
             if ([app respondsToSelector:@selector(_simulateHomeButtonPress)]) { [(SpringBoard *)app _simulateHomeButtonPress]; PFLog(@"unlock: home press sent"); }
@@ -841,6 +848,7 @@ static BOOL PFIsLocked(void) {
 }
 
 static void PFWakeInner(void) {
+    if ([PFScanner shared].mode) return;   // already scanning
     if (!PFIsLocked()) { gFails = 0; return; }
     id en = PFPrefGet(@"enabled");
     if (en && ![en boolValue]) { PFLog(@"wake: skipped, tweak switched off"); return; }      // master switch
@@ -861,7 +869,7 @@ static void PFWakeInner(void) {
         [PFLockIcon setState:PFIconUnlocked];
         if (!PFIsLocked()) return;
         // brief pause so the open padlock is visible, like Face ID
-        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 300 * NSEC_PER_MSEC), dispatch_get_main_queue(), ^{
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 120 * NSEC_PER_MSEC), dispatch_get_main_queue(), ^{
             if (!PFIsLocked()) return;
             @try { PFUnlock(pw); } @catch (NSException *e) { PFLog(@"unlock exception: %@", e); }
             dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 2500 * NSEC_PER_MSEC), dispatch_get_main_queue(), ^{
@@ -892,7 +900,11 @@ static void PFRetry(void) {
 }
 
 %hook CSCoverSheetViewController
-- (void)viewWillAppear:(BOOL)a { %orig; [PFLockIcon attachTo:self.view refresh:YES]; [PFLockIcon watch:YES host:self.view]; }
+- (void)viewWillAppear:(BOOL)a {
+    %orig;
+    [PFLockIcon attachTo:self.view refresh:YES]; [PFLockIcon watch:YES host:self.view];
+    if (gEarlyTrigger && PFScreenOn()) dispatch_async(dispatch_get_main_queue(), ^{ PFWake(); });   // start the camera as soon as the lock screen appears
+}
 - (void)viewDidDisappear:(BOOL)a { %orig; [PFLockIcon watch:NO host:nil]; }
 - (void)viewDidLayoutSubviews { %orig; [PFLockIcon attachTo:self.view refresh:NO]; }
 %end
@@ -936,8 +948,7 @@ static void PFRetry(void) {
             SecItemDelete((__bridge CFDictionaryRef)PFQ());
             PFPrefSet(@"status", @"Not enrolled");
         });
-        static int t4;
-        notify_register_dispatch("com.apple.springboard.hasBlankedScreen", &t4, dispatch_get_main_queue(), ^(int t) {
+        notify_register_dispatch("com.apple.springboard.hasBlankedScreen", &gBlankTok, dispatch_get_main_queue(), ^(int t) {
             uint64_t st = 1; notify_get_state(t, &st);
             if (st == 0) PFWake(); else [PFLockIcon setState:PFIconLocked];
         });

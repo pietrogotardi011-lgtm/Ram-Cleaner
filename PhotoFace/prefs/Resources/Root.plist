@@ -24,8 +24,8 @@
   <key>key</key><string>iconYPct</string>
   <key>PostNotification</key><string>com.photoface.prefschanged</string>
   <key>default</key><real>19</real>
-  <key>min</key><real>3</real>
-  <key>max</key><real>97</real>
+  <key>min</key><real>0</real>
+  <key>max</key><real>100</real>
   <key>showValue</key><true/></dict>
  <dict><key>cell</key><string>PSSliderCell</string>
   <key>defaults</key><string>com.photoface.tweak</string>
@@ -41,6 +41,33 @@
   <key>key</key><string>hideOnPasscode</string>
   <key>PostNotification</key><string>com.photoface.prefschanged</string>
   <key>default</key><true/></dict>
+
+ <dict><key>cell</key><string>PSGroupCell</string><key>label</key><string>Speed</string>
+  <key>footerText</key><string>Start scan early: begins the camera as soon as the lock screen appears. Camera start delay: lower is faster, raise it if the camera fails to start (0-600 ms). Frames to confirm: 1 is fastest, 4 is the most careful and hardest to fool.</string></dict>
+ <dict><key>cell</key><string>PSSwitchCell</string>
+  <key>label</key><string>Start Scan Early</string>
+  <key>defaults</key><string>com.photoface.tweak</string>
+  <key>key</key><string>earlyTrigger</string>
+  <key>PostNotification</key><string>com.photoface.prefschanged</string>
+  <key>default</key><true/></dict>
+ <dict><key>cell</key><string>PSSliderCell</string>
+  <key>defaults</key><string>com.photoface.tweak</string>
+  <key>key</key><string>startDelay</string>
+  <key>PostNotification</key><string>com.photoface.prefschanged</string>
+  <key>default</key><real>80</real>
+  <key>min</key><real>0</real>
+  <key>max</key><real>600</real>
+  <key>showValue</key><true/></dict>
+ <dict><key>cell</key><string>PSSliderCell</string>
+  <key>defaults</key><string>com.photoface.tweak</string>
+  <key>key</key><string>confirmFrames</string>
+  <key>PostNotification</key><string>com.photoface.prefschanged</string>
+  <key>default</key><real>2</real>
+  <key>min</key><real>1</real>
+  <key>max</key><real>4</real>
+  <key>isSegmented</key><true/>
+  <key>segmentCount</key><integer>3</integer>
+  <key>showValue</key><true/></dict>
 
  <dict><key>cell</key><string>PSGroupCell</string><key>label</key><string>Face Data</string>
   <key>footerText</key><string>Set Up takes you to the Home Screen and shows a circle like Face ID setup: look at the camera, then slowly move your head in a circle. Use Test Recognition to see live match scores.</string></dict>
