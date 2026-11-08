@@ -1,6 +1,6 @@
 #!/bin/sh
 mkdir -p /var/mobile/Library/PhotoFace
-chown -R mobile:mobile /var/mobile/Library/PhotoFace
-chmod 700 /var/mobile/Library/PhotoFace
-sbreload 2>/dev/null || killall -9 SpringBoard
+chown -R mobile:mobile /var/mobile/Library/PhotoFace 2>/dev/null
+chmod 700 /var/mobile/Library/PhotoFace 2>/dev/null
+# no respring here: the package manager does it after dpkg finishes
 exit 0

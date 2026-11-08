@@ -15,6 +15,7 @@ jobs:
       - name: Build
         working-directory: PhotoFace
         run: |
+          sed -i '' "s/^Version: .*/Version: 0.2.${{ github.run_number }}/" control
           export THEOS=$HOME/theos
           export PATH="$(brew --prefix make)/libexec/gnubin:$PATH"
           set +e
