@@ -9,12 +9,24 @@
   <key>label</key><string>Enable PhotoFace</string>
   <key>defaults</key><string>com.photoface.tweak</string>
   <key>key</key><string>enabled</string>
+  <key>PostNotification</key><string>com.photoface.prefschanged</string>
   <key>default</key><true/></dict>
  <dict><key>cell</key><string>PSSwitchCell</string>
   <key>label</key><string>Lock Screen Icon</string>
   <key>defaults</key><string>com.photoface.tweak</string>
   <key>key</key><string>showIcon</string>
+  <key>PostNotification</key><string>com.photoface.prefschanged</string>
   <key>default</key><true/></dict>
+ <dict><key>cell</key><string>PSGroupCell</string><key>label</key><string>Icon Position</string>
+  <key>footerText</key><string>Height of the lock screen icon above the bottom edge. Applies instantly, no respring. If the icon fails to recognise you, tap it on the lock screen to try again.</string></dict>
+ <dict><key>cell</key><string>PSSliderCell</string>
+  <key>defaults</key><string>com.photoface.tweak</string>
+  <key>key</key><string>iconY</string>
+  <key>PostNotification</key><string>com.photoface.prefschanged</string>
+  <key>default</key><real>128</real>
+  <key>min</key><real>60</real>
+  <key>max</key><real>400</real>
+  <key>showValue</key><true/></dict>
 
  <dict><key>cell</key><string>PSGroupCell</string><key>label</key><string>Face Data</string>
   <key>footerText</key><string>Set Up takes you to the Home Screen and shows a circle like Face ID setup: look at the camera, then slowly move your head in a circle. Use Test Recognition to see live match scores.</string></dict>

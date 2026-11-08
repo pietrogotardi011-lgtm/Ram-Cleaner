@@ -44,6 +44,12 @@ static void PFPrefSet(NSString *k, id v) {
     CFPreferencesSetAppValue((__bridge CFStringRef)k, (__bridge CFPropertyListRef)v, kPrefDom);
     CFPreferencesAppSynchronize(kPrefDom);
 }
+static CGFloat gIconY = 128;   // distance of the lock icon centre from the screen bottom
+static void PFLoadIconY(void) {
+    id v = PFPrefGet(@"iconY");
+    CGFloat y = v ? [v floatValue] : 128;
+    gIconY = MAX(40, MIN(500, y));
+}
 static NSString *PFDBPath(void) { return [kDir stringByAppendingPathComponent:@"db.bin"]; }
 static void PFRefreshStatus(void) {
     PFPrefSet(@"status", [[NSFileManager defaultManager] fileExistsAtPath:PFDBPath()] ? @"Enrolled" : @"Not enrolled");
@@ -652,6 +658,7 @@ static UIColor *PFGreen(void) { return [UIColor colorWithRed:0.19 green:0.82 blu
 
 #pragma mark - lock screen icon
 
+static void PFRetry(void);
 typedef NS_ENUM(int, PFIconState) { PFIconLocked, PFIconScanning, PFIconUnlocked, PFIconFailed };
 
 @interface CSCoverSheetViewController : UIViewController
@@ -661,6 +668,7 @@ typedef NS_ENUM(int, PFIconState) { PFIconLocked, PFIconScanning, PFIconUnlocked
 + (instancetype)shared;
 + (void)setState:(PFIconState)s;
 + (void)attachTo:(UIView *)host refresh:(BOOL)refresh;
++ (void)reload;
 @end
 
 @implementation PFLockIcon {
@@ -677,7 +685,8 @@ static UIImage *PFSym(NSString *n, CGFloat pt) {
 }
 - (instancetype)initWithFrame:(CGRect)f {
     if (!(self = [super initWithFrame:f])) return nil;
-    self.userInteractionEnabled = NO;
+    self.userInteractionEnabled = YES;   // tap to retry
+    [self addGestureRecognizer:[[UITapGestureRecognizer alloc] initWithTarget:self action:@selector(tapped)]];
     _face = [[UIImageView alloc] initWithFrame:CGRectMake(4, 0, 40, 40)];
     _face.contentMode = UIViewContentModeScaleAspectFit;
     _lock = [[UIImageView alloc] initWithFrame:CGRectMake(15, 43, 18, 20)];
@@ -690,6 +699,8 @@ static UIImage *PFSym(NSString *n, CGFloat pt) {
     [self apply:PFIconLocked];
     return self;
 }
+- (void)tapped { if (_state != PFIconScanning) PFRetry(); }
+- (BOOL)pointInside:(CGPoint)p withEvent:(UIEvent *)e { return CGRectContainsPoint(CGRectInset(self.bounds, -24, -24), p); }
 - (void)apply:(PFIconState)s {
     _state = s;
     [self.layer removeAllAnimations]; [_face.layer removeAllAnimations];
@@ -735,8 +746,16 @@ static UIImage *PFSym(NSString *n, CGFloat pt) {
     if (i.superview != host) { [i removeFromSuperview]; [host addSubview:i]; }
     [host bringSubviewToFront:i];
     CGSize sz = host.bounds.size;
-    i.center = CGPointMake(sz.width / 2, sz.height - 128);   // just above the "Press home to unlock" text
+    i.center = CGPointMake(sz.width / 2, sz.height - gIconY);
     if (refresh) [i refresh];
+}
++ (void)reload {
+    dispatch_async(dispatch_get_main_queue(), ^{
+        PFLoadIconY();
+        PFLockIcon *i = [PFLockIcon shared];
+        [i refresh];
+        if (i.superview) i.center = CGPointMake(i.superview.bounds.size.width / 2, i.superview.bounds.size.height - gIconY);
+    });
 }
 @end
 
@@ -818,6 +837,16 @@ static void PFWake(void) {
     if (![PFScanner shared].mode) PFGuardEnd();
 }
 
+// tap on the lock icon: clear the lockout and scan again right now
+static void PFRetry(void) {
+    if ([PFScanner shared].mode) return;
+    gFails = 0;
+    PFLog(@"retry: icon tapped");
+    PFGuardBegin();
+    @try { PFWakeInner(); } @catch (NSException *e) { PFLog(@"retry exception: %@", e); }
+    if (![PFScanner shared].mode) PFGuardEnd();
+}
+
 %hook CSCoverSheetViewController
 - (void)viewWillAppear:(BOOL)a { %orig; [PFLockIcon attachTo:self.view refresh:YES]; }
 - (void)viewDidLayoutSubviews { %orig; [PFLockIcon attachTo:self.view refresh:NO]; }
@@ -833,6 +862,9 @@ static void PFWake(void) {
 %ctor {
     @autoreleasepool {
         %init;
+        PFLoadIconY();
+        static int t5;
+        notify_register_dispatch("com.photoface.prefschanged", &t5, dispatch_get_main_queue(), ^(int t) { [PFLockIcon reload]; });
         static int t1, t2, t3;
         notify_register_dispatch("com.photoface.enroll", &t1, dispatch_get_main_queue(), ^(int t) {
             NSString *p = [kDir stringByAppendingPathComponent:@"passcode.tmp"];
