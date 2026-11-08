@@ -17,7 +17,14 @@ jobs:
         run: |
           export THEOS=$HOME/theos
           export PATH="$(brew --prefix make)/libexec/gnubin:$PATH"
-          make package FINALPACKAGE=1
+          set +e
+          make package FINALPACKAGE=1 > build.log 2>&1
+          rc=$?
+          if [ $rc -ne 0 ]; then
+            grep -nE "error|Error|fatal|No rule|not found" build.log | head -12 | while IFS= read -r l; do echo "::error::$(echo "$l" | cut -c1-300)"; done
+            tail -5 build.log | while IFS= read -r l; do echo "::error::TAIL $(echo "$l" | cut -c1-300)"; done
+          fi
+          exit $rc
       - uses: actions/upload-artifact@v4
         with:
           name: PhotoFace-deb
