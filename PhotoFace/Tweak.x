@@ -349,6 +349,14 @@ static float PFLimit(NSDictionary *db) {
         const char *rn = r == 1 ? "not foreground" : r == 2 ? "audio in use" : r == 3 ? "camera in use by another app" : r == 4 ? "multiple foreground apps" : r == 5 ? "system pressure" : "unknown";
         st->_interrupt = [NSString stringWithFormat:@"camera interrupted (reason %ld: %s)", r, rn]; st->_intReason = r;
         PFLog(@"interrupted reason=%ld (%s) appState=%ld frontApp=%@", r, rn, (long)[UIApplication sharedApplication].applicationState, PFFrontApp());
+        if (r == 1) dispatch_async(dispatch_get_main_queue(), ^{
+            UIApplication *a = [UIApplication sharedApplication];
+            if (a.applicationState == UIApplicationStateBackground) {
+                PFLog(@"nudge: SpringBoard reports Background, posting WillEnterForeground/DidBecomeActive");
+                [[NSNotificationCenter defaultCenter] postNotificationName:UIApplicationWillEnterForegroundNotification object:a];
+                [[NSNotificationCenter defaultCenter] postNotificationName:UIApplicationDidBecomeActiveNotification object:a];
+            }
+        });
     }]];
     [_obs addObject:[nc addObserverForName:AVCaptureSessionInterruptionEndedNotification object:s queue:nil usingBlock:^(NSNotification *n) {
         PFScanner *st = ws; if (st) { st->_interrupt = nil; st->_intReason = 0; }
@@ -767,10 +775,13 @@ static UIColor *PFGreen(void) { return [UIColor colorWithRed:0.19 green:0.82 blu
         _hint.textColor = [UIColor colorWithRed:1 green:0.35 blue:0.3 alpha:1];
         NSString *lg = [NSString stringWithContentsOfFile:[kDir stringByAppendingPathComponent:@"log.txt"] encoding:NSUTF8StringEncoding error:nil] ?: @"";
         NSArray *ls = [lg componentsSeparatedByString:@"\n"]; NSMutableArray *tail = [NSMutableArray new];
-        for (NSInteger k = MAX(0, (NSInteger)ls.count - 16); k < (NSInteger)ls.count; k++) {
+        NSArray *keys = @[@"env[", @"interrupt", @"nudge", @"camera-auth", @"front app", @"close:", @"home ", @"no frames", @"finish", @"start mode", @"session did", @"runtime error"];
+        for (NSInteger k = (NSInteger)ls.count - 1; k >= 0 && tail.count < 16; k--) {
             NSString *l = ls[k]; if (!l.length) continue;
+            BOOL hit = NO; for (NSString *key in keys) if ([l containsString:key]) { hit = YES; break; }
+            if (!hit) continue;
             if (l.length > 26) l = [l substringFromIndex:26];   // drop the date prefix
-            [tail addObject:l];
+            [tail insertObject:l atIndex:0];
         }
         _sub.frame = CGRectMake(14, _sub.frame.origin.y, _w.bounds.size.width - 28, _w.bounds.size.height - _sub.frame.origin.y - 140);
         _sub.font = [UIFont monospacedSystemFontOfSize:9 weight:UIFontWeightRegular];
