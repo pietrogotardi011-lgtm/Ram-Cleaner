@@ -19,18 +19,6 @@ static void PFSet(NSString *k, id v) {
     CFPreferencesAppSynchronize(kDom);
 }
 
-@interface UIApplication (PFPrivate)
-- (void)suspend;
-@end
-
-// Send Settings to the Home Screen (same as pressing Home) so SpringBoard can use the camera and show the setup UI.
-static void PFLeaveSettings(void) {
-    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 300 * NSEC_PER_MSEC), dispatch_get_main_queue(), ^{
-        UIApplication *app = [UIApplication sharedApplication];
-        if ([app respondsToSelector:@selector(suspend)]) [app suspend];
-    });
-}
-
 @interface PFRootListController : PSListController
 @end
 
@@ -47,7 +35,7 @@ static void PFLeaveSettings(void) {
 }
 - (void)enroll:(PSSpecifier *)s {
     UIAlertController *a = [UIAlertController alertControllerWithTitle:@"Set Up PhotoFace"
-        message:@"Enter your device passcode twice. It is stored in the Keychain and entered for you when your face matches.\n\nAfter you tap Start, you'll be taken to the Home Screen where the face setup circle appears."
+        message:@"Enter your device passcode twice. It is stored in the Keychain and entered for you when your face matches.\n\nAfter you tap Start, the PhotoFace Enroll screen opens and scans your face."
         preferredStyle:UIAlertControllerStyleAlert];
     [a addTextFieldWithConfigurationHandler:^(UITextField *t) { t.secureTextEntry = YES; t.placeholder = @"Passcode"; }];
     [a addTextFieldWithConfigurationHandler:^(UITextField *t) { t.secureTextEntry = YES; t.placeholder = @"Confirm passcode"; }];
@@ -62,13 +50,11 @@ static void PFLeaveSettings(void) {
         notify_post("com.photoface.enroll");
         [self reloadSpecifiers];
         [self startPolling];
-        PFLeaveSettings();
     }]];
     [self presentViewController:a animated:YES completion:nil];
 }
 - (void)testRecognition:(PSSpecifier *)s {
     notify_post("com.photoface.test");
-    PFLeaveSettings();
 }
 - (void)alert:(NSString *)t msg:(NSString *)m {
     UIAlertController *a = [UIAlertController alertControllerWithTitle:t message:m preferredStyle:UIAlertControllerStyleAlert];

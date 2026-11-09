@@ -15,7 +15,7 @@ pfenroll_FILES = pfenroll.c
 include $(THEOS_MAKE_PATH)/tweak.mk
 include $(THEOS_MAKE_PATH)/tool.mk
 
-SUBPROJECTS += prefs
+SUBPROJECTS += prefs app
 include $(THEOS_MAKE_PATH)/aggregate.mk
 
 before-package::

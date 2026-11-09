@@ -13,6 +13,7 @@
 #import <objc/message.h>
 #import <mach-o/dyld.h>
 #import <signal.h>
+#import <dlfcn.h>
 
 @interface SBLockScreenManager : NSObject
 + (instancetype)sharedInstance;
@@ -48,6 +49,7 @@ static int gFails = 0;
 static BOOL PFScreenActive(void);
 static BOOL gForceScan = NO;
 static NSString *gPendingPW = nil;
+static int gEnrollMode = 0, gEnrollGen = 0;   // which scan the Enroll app is running (2 setup / 3 test)
 static BOOL gEnrolling = NO;   // setup/test UI is up or being brought up: lock-screen verify must stay out of the way
 
 #pragma mark - helpers
@@ -228,6 +230,28 @@ static BOOL PFCloseFrontApp(NSString *bid) {
         if (pid > 1) { kill(pid, SIGKILL); PFLog(@"close: kill(%d) for %@", pid, bid); return YES; }
     } @catch (NSException *e) {}
     PFLog(@"close: no way to terminate %@", bid);
+    return NO;
+}
+
+// Launch the bundled PhotoFace Enroll app. A real foreground app is the one thing the camera daemon always lets use the camera.
+static NSString *const kEnrollApp = @"com.photoface.enroll";
+static BOOL PFLaunchEnrollApp(void) {
+    id app = [UIApplication sharedApplication];
+    SEL a = NSSelectorFromString(@"launchApplicationWithIdentifier:suspended:");
+    if ([app respondsToSelector:a]) {
+        BOOL r = ((BOOL (*)(id, SEL, id, BOOL))objc_msgSend)(app, a, kEnrollApp, NO);
+        PFLog(@"launch: launchApplicationWithIdentifier -> %d", r);
+        if (r) return YES;
+    }
+    void *h = dlopen("/System/Library/PrivateFrameworks/SpringBoardServices.framework/SpringBoardServices", RTLD_LAZY);
+    typedef int (*LaunchFn)(CFStringRef, Boolean);
+    LaunchFn f = h ? (LaunchFn)dlsym(h, "SBSLaunchApplicationWithIdentifier") : NULL;
+    if (f) {
+        int r = f((__bridge CFStringRef)kEnrollApp, false);
+        PFLog(@"launch: SBSLaunchApplicationWithIdentifier -> %d", r);
+        return r == 0;
+    }
+    PFLog(@"launch: no launch API available");
     return NO;
 }
 
@@ -609,9 +633,26 @@ static float PFLimit(NSDictionary *db) {
 
 + (void)begin:(int)mode {
     if (gEnrolling) { PFLog(@"begin(%d): setup already running, ignoring", mode); return; }
-    gEnrolling = YES;
-    PFLogEnv("before-home");
-    [self awaitHome:mode tries:0];
+    gEnrolling = YES; gEnrollMode = mode;
+    int gen = ++gEnrollGen;
+    PFLogEnv("before-launch");
+    if ([PFScanner shared].mode) [[PFScanner shared] cancel];   // free the camera from any lock-screen scan
+    [[NSFileManager defaultManager] removeItemAtPath:[kDir stringByAppendingPathComponent:@"status.txt"] error:nil];
+    NSString *mp = [kDir stringByAppendingPathComponent:@"mode.txt"];
+    [[NSString stringWithFormat:@"%d", mode] writeToFile:mp atomically:YES encoding:NSUTF8StringEncoding error:nil];
+    chmod(mp.fileSystemRepresentation, 0644);
+    if (!PFLaunchEnrollApp()) {
+        PFEnrollAbort(@"couldn't launch the PhotoFace Enroll app (is it installed? run uicache)");
+        return;
+    }
+    // if the app never reports back (killed, crashed) don't stay stuck
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 200 * NSEC_PER_SEC), dispatch_get_main_queue(), ^{
+        if (gEnrolling && gEnrollGen == gen) {
+            PFLog(@"enroll app never reported back, resetting");
+            if (gEnrollMode == 2) PFEnrollAbort(@"the Enroll app didn't finish");
+            else gEnrolling = NO;
+        }
+    });
 }
 // Settings normally suspends itself (prefs bundle). If anything is still in front we ask for Home,
 // then close it through FrontBoard. We never lock the device: the setup UI can't show there.
@@ -1112,6 +1153,25 @@ static void PFBeginEnroll(int attempt) {
         notify_register_dispatch("com.photoface.test", &t2, dispatch_get_main_queue(), ^(int t) {
             PFLog(@"test requested");
             [PFSetup begin:3];
+        });
+        static int t6;
+        notify_register_dispatch("com.photoface.enrolldone", &t6, dispatch_get_main_queue(), ^(int t) {
+            int mode = gEnrollMode;
+            PFLog(@"enroll app reported done (mode %d)", mode);
+            gEnrolling = NO; gEnrollMode = 0;
+            if (mode != 2) return;
+            NSString *st = [NSString stringWithContentsOfFile:[kDir stringByAppendingPathComponent:@"status.txt"] encoding:NSUTF8StringEncoding error:nil] ?: @"";
+            if ([st hasPrefix:@"ok"]) {
+                if (gPendingPW) PFSavePW(gPendingPW);
+                gPendingPW = nil; gFails = 0;
+                NSString *info = st.length > 4 ? [st substringFromIndex:4] : @"";
+                PFPrefSet(@"status", [NSString stringWithFormat:@"Enrolled (%@)", info]);
+            } else if ([st hasPrefix:@"cancel"]) {
+                gPendingPW = nil; PFRefreshStatus();
+            } else {
+                gPendingPW = nil;
+                PFPrefSet(@"status", [@"Failed: " stringByAppendingString:st.length > 6 ? [st substringFromIndex:6] : @"unknown"]);
+            }
         });
         notify_register_dispatch("com.photoface.clear", &t3, dispatch_get_main_queue(), ^(int t) {
             [[NSFileManager defaultManager] removeItemAtPath:PFDBPath() error:nil];
