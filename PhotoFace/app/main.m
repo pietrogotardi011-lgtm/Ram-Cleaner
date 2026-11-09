@@ -18,6 +18,8 @@
 
 static NSString *const kDir = @"/var/mobile/Library/PhotoFace";
 static CFStringRef const kPrefDom = CFSTR("com.photoface.tweak");
+#define kNeedCenter 6   // straight-ahead samples
+#define kNeedPer 3      // samples per head direction (8 directions)
 
 #pragma mark - helpers
 
@@ -113,6 +115,7 @@ static void PFInstallCrashRecorder(void) {
     NSMutableArray *_got; NSMutableArray<NSNumber *> *_bins;
     NSDictionary *_db; void (^_done)(BOOL, NSString *);
     NSString *_interrupt; NSMutableArray *_obs;
+    float _biasX, _biasY, _cSumX, _cSumY; int _cN, _lastSec; NSTimeInterval _lastCap;
 }
 @synthesize session = _s;
 
@@ -205,6 +208,7 @@ static void PFInstallCrashRecorder(void) {
     _done = [done copy]; _center = 0; memset(_secCount, 0, sizeof _secCount);
     _got = [NSMutableArray new]; _bins = [NSMutableArray new];
     _frames = 0; _interrupt = nil; _lastProc = 0; _retries = 0;
+    _biasX = _biasY = _cSumX = _cSumY = 0; _cN = 0; _lastSec = -1; _lastCap = 0;
     _startTS = CACurrentMediaTime(); _lastFrameTS = _startTS; _lastGain = _startTS;
     _deadlineTS = _startTS + t;
     NSString *err = [self build];
@@ -319,7 +323,7 @@ static void PFInstallCrashRecorder(void) {
     CVPixelBufferRef pb = CMSampleBufferGetImageBuffer(sb);
     if (!pb) return;
 
-    VNDetectFaceRectanglesRequest *fr = [VNDetectFaceRectanglesRequest new];
+    VNRequest *fr = (mode == 2) ? (VNRequest *)[VNDetectFaceLandmarksRequest new] : (VNRequest *)[VNDetectFaceRectanglesRequest new];
     VNImageRequestHandler *h = [[VNImageRequestHandler alloc] initWithCVPixelBuffer:pb options:@{}];
     if (![h performRequests:@[fr] error:nil]) return;
     NSArray *faces = fr.results;
@@ -330,33 +334,63 @@ static void PFInstallCrashRecorder(void) {
     if (hint) { [self report:@{@"hint": hint, @"face": @NO}]; return; }
 
     if (mode == 2) {
-        float yaw = NAN, pitch = NAN;
-        if (f.yaw) yaw = f.yaw.floatValue;
-        if (@available(iOS 15.0, *)) { if (f.pitch) pitch = f.pitch.floatValue; }
-        int bin;
-        if (isnan(yaw) || isnan(pitch)) bin = (_center < 4) ? -1 : (int)(_got.count % 8);
-        else {
-            float mag = hypotf(yaw, pitch);
-            if (mag < 0.15f) bin = -1;
-            else bin = ((int)lroundf(atan2f(pitch, yaw) / (float)(M_PI / 4)) + 8) % 8;
+        // Head direction from where the nose sits inside the face (screen space: x right, y up). Works whatever
+        // the signs of Vision's yaw/pitch are, and matches what the user sees in the mirrored preview.
+        float px = 0, py = 0; BOOL havePose = NO;
+        VNFaceLandmarks2D *lm = f.landmarks;
+        if (lm && lm.nose && lm.allPoints && lm.nose.pointCount > 0 && lm.allPoints.pointCount > 0) {
+            const CGPoint *np = lm.nose.normalizedPoints, *ap = lm.allPoints.normalizedPoints;
+            size_t nc = lm.nose.pointCount, ac = lm.allPoints.pointCount;
+            float nx = 0, ny = 0, ax = 0, ay = 0;
+            for (size_t i = 0; i < nc; i++) { nx += np[i].x; ny += np[i].y; }
+            for (size_t i = 0; i < ac; i++) { ax += ap[i].x; ay += ap[i].y; }
+            nx /= nc; ny /= nc; ax /= ac; ay /= ac;
+            float ox = nx - ax, oy = ny - ay;
+            px = c.isVideoMirrored ? ox : -ox; py = oy; havePose = YES;
+        } else {
+            float yaw = f.yaw ? f.yaw.floatValue : 0, pitch = 0;
+            if (@available(iOS 15.0, *)) { if (f.pitch) pitch = f.pitch.floatValue; }
+            px = yaw; py = pitch;
         }
-        BOOL need = (bin == -1) ? (_center < 4) : (_secCount[bin] < 2);
-        if (need) {
+        BOOL cd = _center >= kNeedCenter;
+        float qx = cd ? px - _biasX : px, qy = cd ? py - _biasY : py;
+        float mag = hypotf(qx, qy);
+        float cthr = havePose ? 0.10f : 0.15f, sthr = havePose ? 0.05f : 0.15f;
+        int bin = -2;   // -2 = in between, ignore
+        if (!cd) { if (mag < cthr) bin = -1; }
+        else if (mag >= sthr) bin = ((int)lroundf(atan2f(qy, qx) / (float)(M_PI / 4)) % 8 + 8) % 8;
+        BOOL need = (bin == -1) ? (_center < kNeedCenter) : (bin >= 0 ? _secCount[bin] < kNeedPer : NO);
+        if (need && now - _lastCap >= 0.25) {
             VNFeaturePrintObservation *fp = [self printFor:pb face:f.boundingBox];
             if (fp) {
                 [_got addObject:fp]; [_bins addObject:@(bin)];
-                if (bin == -1) _center++; else _secCount[bin]++;
-                _lastGain = now;
+                if (bin == -1) {
+                    _center++; _cSumX += px; _cSumY += py; _cN++;
+                    if (_center >= kNeedCenter) { _biasX = _cSumX / _cN; _biasY = _cSumY / _cN; PFLog(@"center done, bias %.3f %.3f", _biasX, _biasY); }
+                } else { _secCount[bin]++; _lastSec = bin; }
+                _lastGain = now; _lastCap = now;
             }
         }
-        int secUnits = 0; for (int k = 0; k < 8; k++) secUnits += MIN(_secCount[k], 2);
-        NSString *msg;
-        if (_center < 4) msg = @"Position your face in the circle\nand look straight ahead";
-        else if (secUnits < 12) msg = (now - _lastGain > 6) ? @"Keep going: tilt your head further\nup, down, left and right"
-                                                           : @"Now slowly move your head\nin a circle";
-        else msg = @"Almost done…";
-        [self report:@{@"hint": msg, @"face": @YES}];
-        if (_center >= 4 && secUnits >= 12) [self finalizeEnroll];
+        cd = _center >= kNeedCenter;
+        int full = 0, total = MIN(_center, kNeedCenter);
+        NSMutableArray *cnt = [NSMutableArray new];
+        for (int k = 0; k < 8; k++) { if (_secCount[k] >= kNeedPer) full++; total += MIN(_secCount[k], kNeedPer); [cnt addObject:@(MIN(_secCount[k], kNeedPer))]; }
+        int target = -1;
+        if (cd) {   // next gap, going clockwise from where we last were
+            int start = _lastSec >= 0 ? _lastSec : 2;
+            for (int t = 0; t < 8; t++) { int k = ((start - t) % 8 + 8) % 8; if (_secCount[k] < kNeedPer) { target = k; break; } }
+        }
+        int pct = total * 100 / (kNeedCenter + 8 * kNeedPer);
+        NSString *msg, *sub;
+        if (!cd) { msg = @"Look straight at the camera\nand hold still"; sub = [NSString stringWithFormat:@"Step 1 of 2  ·  %d%%", pct]; }
+        else if (full < 7) {
+            if (bin == target) msg = @"Good, hold it there…";
+            else msg = (now - _lastGain > 5) ? @"Tilt a little further toward\nthe glowing part of the ring" : @"Slowly move your head toward\nthe glowing part of the ring";
+            sub = [NSString stringWithFormat:@"Step 2 of 2  ·  %d%%  ·  keep your face in the circle", pct];
+        } else { msg = @"Almost done…"; sub = @"Finishing up"; }
+        [self report:@{@"hint": msg, @"sub": sub, @"face": @YES, @"sectors": cnt, @"target": @(target),
+                       @"centerDone": @(cd), @"dx": @(qx), @"dy": @(qy)}];
+        if (cd && (full >= 7 || (now - _startTS > 55 && full >= 5))) [self finalizeEnroll];
         return;
     }
 
@@ -398,7 +432,7 @@ static void PFInstallCrashRecorder(void) {
 
 @implementation PFVC {
     PFScan *_scan; UIView *_circle; AVCaptureVideoPreviewLayer *_pl;
-    NSMutableArray<CAShapeLayer *> *_ticks;
+    NSMutableArray<CAShapeLayer *> *_ticks; CAShapeLayer *_dot; int _tickSector[24], _pulseTarget;
     UILabel *_title, *_hint, *_sub; UIButton *_btn;
     int _mode; BOOL _running, _finished;
 }
@@ -439,7 +473,16 @@ static void PFInstallCrashRecorder(void) {
         l.path = p.CGPath; l.lineWidth = 4; l.lineCap = kCALineCapRound;
         l.strokeColor = [UIColor colorWithWhite:0.25 alpha:1].CGColor;
         [v.layer addSublayer:l]; [_ticks addObject:l];
+        float th = (90.f - 15.f * i) * (float)M_PI / 180.f;   // screen direction of this tick, counter-clockwise from "right"
+        _tickSector[i] = ((int)lroundf(th / (float)(M_PI / 4)) % 8 + 8) % 8;
     }
+    _pulseTarget = -2;
+    _dot = [CAShapeLayer layer];
+    _dot.path = [UIBezierPath bezierPathWithOvalInRect:CGRectMake(-9, -9, 18, 18)].CGPath;
+    _dot.fillColor = UIColor.whiteColor.CGColor;
+    _dot.shadowColor = UIColor.blackColor.CGColor; _dot.shadowOpacity = 0.6; _dot.shadowRadius = 3; _dot.shadowOffset = CGSizeZero;
+    _dot.zPosition = 10; _dot.hidden = YES;
+    [_circle.layer addSublayer:_dot];
 
     CGFloat hy = cy + d / 2 + 48;
     _hint = [self label:CGRectMake(24, hy, W - 48, 64) size:20 weight:UIFontWeightMedium color:UIColor.whiteColor];
@@ -490,6 +533,7 @@ static void PFInstallCrashRecorder(void) {
     [_btn setTitle:@"Cancel" forState:UIControlStateNormal];
     [_btn setTitleColor:UIColor.whiteColor forState:UIControlStateNormal];
     [self lightTicks:0 color:PFGreen()];
+    _pulseTarget = -2; _dot.hidden = YES; _circle.layer.borderWidth = 0;
 
     _scan = [PFScan new];
     __weak PFVC *ws = self;
@@ -504,13 +548,43 @@ static void PFInstallCrashRecorder(void) {
     }];
 }
 
+- (void)applyRing:(NSArray *)cnt target:(int)tgt centerDone:(BOOL)cd {
+    int per[8] = {0}, idx[24];
+    for (int i = 0; i < 24; i++) idx[i] = per[_tickSector[i]]++;
+    if (tgt != _pulseTarget) { for (CAShapeLayer *l in _ticks) [l removeAllAnimations]; _pulseTarget = tgt; }
+    for (int i = 0; i < 24; i++) {
+        int sct = _tickSector[i], c = MIN([cnt[sct] intValue], kNeedPer);
+        int filled = (int)ceilf(per[sct] * c / (float)kNeedPer);
+        CAShapeLayer *l = _ticks[i];
+        if (idx[i] < filled) { l.strokeColor = PFGreen().CGColor; [l removeAnimationForKey:@"pulse"]; }
+        else if (sct == tgt) {
+            l.strokeColor = UIColor.whiteColor.CGColor;
+            if (![l animationForKey:@"pulse"]) {
+                CABasicAnimation *a = [CABasicAnimation animationWithKeyPath:@"opacity"];
+                a.fromValue = @1; a.toValue = @0.25; a.duration = 0.55; a.autoreverses = YES; a.repeatCount = HUGE_VALF;
+                [l addAnimation:a forKey:@"pulse"];
+            }
+        } else { l.strokeColor = [UIColor colorWithWhite:0.25 alpha:1].CGColor; [l removeAnimationForKey:@"pulse"]; }
+    }
+    _circle.layer.borderWidth = 3;
+    _circle.layer.borderColor = (cd ? PFGreen() : [UIColor colorWithWhite:0.3 alpha:1]).CGColor;
+}
+
 - (void)update:(NSDictionary *)i {
     if (_finished) return;
     [self attachPreview];
     if (_mode == 2) {
-        float u = [i[@"units"] floatValue];
-        [self lightTicks:(int)floorf(24.f * u / 16.f) color:PFGreen()];
+        if (i[@"sectors"]) [self applyRing:i[@"sectors"] target:[i[@"target"] intValue] centerDone:[i[@"centerDone"] boolValue]];
         if (i[@"hint"]) _hint.text = i[@"hint"];
+        if (i[@"sub"]) _sub.text = i[@"sub"];
+        if ([i[@"face"] boolValue] && i[@"dx"]) {   // live "where is my head pointing" dot
+            CGFloat R = _circle.bounds.size.width / 2, k = R / 0.22;
+            CGFloat x = [i[@"dx"] floatValue] * k, y = -[i[@"dy"] floatValue] * k, m = hypot(x, y), lim = R * 0.82;
+            if (m > lim) { x *= lim / m; y *= lim / m; }
+            [CATransaction begin]; [CATransaction setDisableActions:YES];
+            _dot.position = CGPointMake(R + x, R + y); _dot.hidden = NO;
+            [CATransaction commit];
+        } else _dot.hidden = YES;
     } else {
         if (i[@"best"]) {
             float best = [i[@"best"] floatValue], lim = [i[@"limit"] floatValue];
@@ -522,7 +596,8 @@ static void PFInstallCrashRecorder(void) {
 }
 
 - (void)finished:(BOOL)ok info:(NSString *)info {
-    _finished = YES;
+    _finished = YES; _dot.hidden = YES;
+    for (CAShapeLayer *l in _ticks) [l removeAllAnimations];
     BOOL cancelled = [info isEqualToString:@"cancelled"];
     if (_mode == 2) {
         if (ok) PFWriteStatus([@"ok: " stringByAppendingString:info]);
