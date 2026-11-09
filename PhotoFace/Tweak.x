@@ -257,6 +257,14 @@ static float PFLimit(NSDictionary *db) {
     AVCaptureConnection *c = [o connectionWithMediaType:AVMediaTypeVideo];
     if (c.isVideoOrientationSupported) c.videoOrientation = AVCaptureVideoOrientationPortrait;
     [s commitConfiguration];
+    @try {
+        SEL sup = NSSelectorFromString(@"isMultitaskingCameraAccessSupported"), en = NSSelectorFromString(@"setMultitaskingCameraAccessEnabled:");
+        if ([s respondsToSelector:sup] && [s respondsToSelector:en]) {
+            BOOL supported = ((BOOL (*)(id, SEL))objc_msgSend)(s, sup);
+            PFLog(@"multitasking camera access supported=%d", supported);
+            if (supported) ((void (*)(id, SEL, BOOL))objc_msgSend)(s, en, YES);
+        } else PFLog(@"multitasking camera access API not present on this iOS");
+    } @catch (NSException *ex) { PFLog(@"multitasking camera access exception: %@", ex); }
     _s = s;
     __weak PFScanner *ws = self;
     NSNotificationCenter *nc = [NSNotificationCenter defaultCenter];
@@ -269,8 +277,9 @@ static float PFLimit(NSDictionary *db) {
     [_obs addObject:[nc addObserverForName:AVCaptureSessionWasInterruptedNotification object:s queue:nil usingBlock:^(NSNotification *n) {
         long r = [n.userInfo[AVCaptureSessionInterruptionReasonKey] longValue];
         PFScanner *st = ws; if (!st) return;
-        st->_interrupt = [NSString stringWithFormat:@"camera interrupted (reason %ld)", r];
-        PFLog(@"interrupted reason=%ld", r);
+        const char *rn = r == 1 ? "not foreground" : r == 2 ? "audio in use" : r == 3 ? "camera in use by another app" : r == 4 ? "multiple foreground apps" : r == 5 ? "system pressure" : "unknown";
+        st->_interrupt = [NSString stringWithFormat:@"camera interrupted (reason %ld: %s)", r, rn];
+        PFLog(@"interrupted reason=%ld (%s) appState=%ld frontApp=%@", r, rn, (long)[UIApplication sharedApplication].applicationState, PFFrontApp());
     }]];
     [_obs addObject:[nc addObserverForName:AVCaptureSessionInterruptionEndedNotification object:s queue:nil usingBlock:^(NSNotification *n) {
         PFScanner *st = ws; if (st) st->_interrupt = nil;
@@ -346,7 +355,9 @@ static float PFLimit(NSDictionary *db) {
     BOOL patient = (self.mode != 1);   // setup/test: the previous foreground app can take a few seconds to release the camera
     int maxRetries = patient ? 6 : 2;
     NSTimeInterval step = patient ? 1.5 : 1.0, giveUp = patient ? 13.0 : 5.5;
-    if (_frames == 0 && _retries < maxRetries && n - _startTS > step * (_retries + 1)) {
+    BOOL held = _s.isInterrupted;
+    if (patient && held) giveUp = 25.0;   // wait for the interruption to end instead of rebuilding
+    if (_frames == 0 && !held && _retries < maxRetries && n - _startTS > step * (_retries + 1)) {
         _retries++;
         PFLog(@"no frames after %.1fs (running=%d interrupted=%d) - rebuilding session (retry %d)",
               n - _startTS, _s.isRunning, _s.isInterrupted, _retries);
