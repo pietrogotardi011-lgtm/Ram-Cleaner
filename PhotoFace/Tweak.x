@@ -278,7 +278,7 @@ static float PFLimit(NSDictionary *db) {
     int _frames, _hits, _miss, _center, _secCount[8];
     NSMutableArray *_got; NSMutableArray<NSNumber *> *_bins;
     NSDictionary *_db; void (^_done)(BOOL, NSString *);
-    NSString *_interrupt; BOOL _observing; int _retries; dispatch_queue_t _cfg; NSMutableArray *_obs;
+    NSString *_interrupt; long _intReason; NSTimeInterval _lastRebuild; BOOL _observing; int _retries; dispatch_queue_t _cfg; NSMutableArray *_obs;
 }
 @synthesize session = _s;
 
@@ -347,11 +347,11 @@ static float PFLimit(NSDictionary *db) {
         long r = [n.userInfo[AVCaptureSessionInterruptionReasonKey] longValue];
         PFScanner *st = ws; if (!st) return;
         const char *rn = r == 1 ? "not foreground" : r == 2 ? "audio in use" : r == 3 ? "camera in use by another app" : r == 4 ? "multiple foreground apps" : r == 5 ? "system pressure" : "unknown";
-        st->_interrupt = [NSString stringWithFormat:@"camera interrupted (reason %ld: %s)", r, rn];
+        st->_interrupt = [NSString stringWithFormat:@"camera interrupted (reason %ld: %s)", r, rn]; st->_intReason = r;
         PFLog(@"interrupted reason=%ld (%s) appState=%ld frontApp=%@", r, rn, (long)[UIApplication sharedApplication].applicationState, PFFrontApp());
     }]];
     [_obs addObject:[nc addObserverForName:AVCaptureSessionInterruptionEndedNotification object:s queue:nil usingBlock:^(NSNotification *n) {
-        PFScanner *st = ws; if (st) st->_interrupt = nil;
+        PFScanner *st = ws; if (st) { st->_interrupt = nil; st->_intReason = 0; }
         PFLog(@"interruption ended");
     }]];
     [_obs addObject:[nc addObserverForName:AVCaptureSessionDidStartRunningNotification object:s queue:nil usingBlock:^(NSNotification *n) {
@@ -426,7 +426,9 @@ static float PFLimit(NSDictionary *db) {
     NSTimeInterval step = patient ? 1.5 : 1.0, giveUp = patient ? 13.0 : 5.5;
     BOOL held = _s.isInterrupted;
     if (patient && held) giveUp = 25.0;   // wait for the interruption to end instead of rebuilding
-    if (_frames == 0 && !held && _retries < maxRetries && n - _startTS > step * (_retries + 1)) {
+    BOOL staleHold = patient && held && _intReason == 1 && _retries < 8 && n - MAX(_lastRebuild, _startTS) > 3.0;   // "not foreground": rebuild instead of waiting
+    if (_frames == 0 && ((!held && _retries < maxRetries && n - _startTS > step * (_retries + 1)) || staleHold)) {
+        _lastRebuild = n;
         _retries++;
         PFLog(@"no frames after %.1fs (running=%d interrupted=%d) - rebuilding session (retry %d)",
               n - _startTS, _s.isRunning, _s.isInterrupted, _retries);
@@ -609,7 +611,7 @@ static float PFLimit(NSDictionary *db) {
     NSString *fid = PFFrontAppID();
     if (!fid) {
         PFLog(@"home reached (waited %dms)", n * 200);
-        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (n ? 500 : 350) * NSEC_PER_MSEC), dispatch_get_main_queue(), ^{ [[PFSetup shared] present:mode]; });
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (n ? 1500 : 1000) * NSEC_PER_MSEC), dispatch_get_main_queue(), ^{ [[PFSetup shared] present:mode]; });
         return;
     }
     if (n == 0) { PFLog(@"front app is %@, trying Home", fid); PFGoHome(); }
@@ -763,7 +765,17 @@ static UIColor *PFGreen(void) { return [UIColor colorWithRed:0.19 green:0.82 blu
         [self lightTicks:0 color:PFGreen()];
         _hint.text = (_mode == 2) ? @"Setup didn't finish" : @"Test couldn't run";
         _hint.textColor = [UIColor colorWithRed:1 green:0.35 blue:0.3 alpha:1];
-        _sub.text = [NSString stringWithFormat:@"Reason: %@", info];
+        NSString *lg = [NSString stringWithContentsOfFile:[kDir stringByAppendingPathComponent:@"log.txt"] encoding:NSUTF8StringEncoding error:nil] ?: @"";
+        NSArray *ls = [lg componentsSeparatedByString:@"\n"]; NSMutableArray *tail = [NSMutableArray new];
+        for (NSInteger k = MAX(0, (NSInteger)ls.count - 16); k < (NSInteger)ls.count; k++) {
+            NSString *l = ls[k]; if (!l.length) continue;
+            if (l.length > 26) l = [l substringFromIndex:26];   // drop the date prefix
+            [tail addObject:l];
+        }
+        _sub.frame = CGRectMake(14, _sub.frame.origin.y, _w.bounds.size.width - 28, _w.bounds.size.height - _sub.frame.origin.y - 140);
+        _sub.font = [UIFont monospacedSystemFontOfSize:9 weight:UIFontWeightRegular];
+        _sub.textAlignment = NSTextAlignmentLeft;
+        _sub.text = [NSString stringWithFormat:@"Reason: %@\n\n%@", info, [tail componentsJoinedByString:@"\n"]];
         [_btn setTitle:@"Close" forState:UIControlStateNormal];
         _retry.hidden = (_mode != 2) || !gPendingPW;
     }
