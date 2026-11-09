@@ -39,6 +39,7 @@ static int gFails = 0;
 static BOOL PFScreenActive(void);
 static BOOL gForceScan = NO;
 static NSString *gPendingPW = nil;
+static BOOL gEnrolling = NO;   // setup/test UI is up or being brought up: lock-screen verify must stay out of the way
 
 #pragma mark - helpers
 
@@ -245,13 +246,13 @@ static float PFLimit(NSDictionary *db) {
     if (@available(iOS 10.0, *)) s.automaticallyConfiguresCaptureDeviceForWideColor = NO;
     [s beginConfiguration];
     if ([s canSetSessionPreset:AVCaptureSessionPreset640x480]) s.sessionPreset = AVCaptureSessionPreset640x480;
-    if (![s canAddInput:in]) return @"can't add camera input";
+    if (![s canAddInput:in]) { [s commitConfiguration]; return @"can't add camera input"; }
     [s addInput:in];
     AVCaptureVideoDataOutput *o = [AVCaptureVideoDataOutput new];
     o.videoSettings = @{(id)kCVPixelBufferPixelFormatTypeKey: @(kCVPixelFormatType_32BGRA)};
     o.alwaysDiscardsLateVideoFrames = YES;
     [o setSampleBufferDelegate:self queue:_q];
-    if (![s canAddOutput:o]) return @"can't add camera output";
+    if (![s canAddOutput:o]) { [s commitConfiguration]; return @"can't add camera output"; }
     [s addOutput:o];
     AVCaptureConnection *c = [o connectionWithMediaType:AVMediaTypeVideo];
     if (c.isVideoOrientationSupported) c.videoOrientation = AVCaptureVideoOrientationPortrait;
@@ -285,7 +286,14 @@ static float PFLimit(NSDictionary *db) {
 }
 
 - (void)start:(int)mode timeout:(NSTimeInterval)t done:(void (^)(BOOL, NSString *))done {
-    if (self.mode) { done(NO, @"busy"); return; }
+    if (self.mode) {
+        if (mode == 1) { done(NO, @"busy"); return; }
+        // setup/test were requested by the user: a lock-screen verify scan may be holding the camera, so stop it and retry
+        PFLog(@"start mode=%d: stopping running scan (mode %d) first", mode, self.mode);
+        [self finish:NO info:@"cancelled"];
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 600 * NSEC_PER_MSEC), dispatch_get_main_queue(), ^{ [self start:mode timeout:t done:done]; });
+        return;
+    }
     if (mode == 1 || mode == 3) {
         _db = PFLoadDB();
         if (!_db) { done(NO, @"no face enrolled yet"); return; }
@@ -335,7 +343,10 @@ static float PFLimit(NSDictionary *db) {
     NSTimeInterval n = CACurrentMediaTime();
     // no frames: rebuild a brand-new session (new device input), up to 2 times
     if (self.mode == 1 && !PFScreenActive()) { [self finish:NO info:@"screen dimmed/off (AOD)"]; return; }
-    if (_frames == 0 && _retries < 2 && n - _startTS > 1.0 * (_retries + 1)) {
+    BOOL patient = (self.mode != 1);   // setup/test: the previous foreground app can take a few seconds to release the camera
+    int maxRetries = patient ? 6 : 2;
+    NSTimeInterval step = patient ? 1.5 : 1.0, giveUp = patient ? 13.0 : 5.5;
+    if (_frames == 0 && _retries < maxRetries && n - _startTS > step * (_retries + 1)) {
         _retries++;
         PFLog(@"no frames after %.1fs (running=%d interrupted=%d) - rebuilding session (retry %d)",
               n - _startTS, _s.isRunning, _s.isInterrupted, _retries);
@@ -344,7 +355,7 @@ static float PFLimit(NSDictionary *db) {
         [self launchSession];
         return;
     }
-    if (_frames == 0 && n - _startTS > 5.5) {
+    if (_frames == 0 && n - _startTS > giveUp) {
         [self finish:NO info:[NSString stringWithFormat:@"the camera isn't delivering frames (session running: %@, interrupted: %@%@)",
                               _s.isRunning ? @"yes" : @"no", _s.isInterrupted ? @"yes" : @"no",
                               _interrupt ? [NSString stringWithFormat:@", %@", _interrupt] : @""]];
@@ -507,12 +518,23 @@ static float PFLimit(NSDictionary *db) {
 + (instancetype)shared { static PFSetup *i; static dispatch_once_t o; dispatch_once(&o, ^{ i = [PFSetup new]; }); return i; }
 
 + (void)begin:(int)mode {
+    if (gEnrolling) { PFLog(@"begin(%d): setup already running, ignoring", mode); return; }
+    gEnrolling = YES;
     id app = [UIApplication sharedApplication];
     PFLogEnv("before-home");
     if ([app respondsToSelector:@selector(_simulateHomeButtonPress)]) [(SpringBoard *)app _simulateHomeButtonPress];
-    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 700 * NSEC_PER_MSEC), dispatch_get_main_queue(), ^{
-        [[PFSetup shared] present:mode];
-    });
+    [self awaitHome:mode tries:0];
+}
++ (void)awaitHome:(int)mode tries:(int)n {
+    // the camera stays "in use" by Settings until it is backgrounded, so poll instead of guessing a delay
+    NSString *fa = PFFrontApp();
+    BOOL clear = [fa hasPrefix:@"(none"] || [fa hasPrefix:@"(selector"] || [fa hasPrefix:@"(exception"];
+    if (clear || n >= 20) {
+        PFLog(@"home reached (frontApp=%@, waited %dms)", fa, n * 200);
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 350 * NSEC_PER_MSEC), dispatch_get_main_queue(), ^{ [[PFSetup shared] present:mode]; });
+        return;
+    }
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 200 * NSEC_PER_MSEC), dispatch_get_main_queue(), ^{ [self awaitHome:mode tries:n + 1]; });
 }
 
 static UIColor *PFGreen(void) { return [UIColor colorWithRed:0.19 green:0.82 blue:0.35 alpha:1]; }
@@ -525,7 +547,11 @@ static UIColor *PFGreen(void) { return [UIColor colorWithRed:0.19 green:0.82 blu
 }
 
 - (void)present:(int)mode {
-    if (_w) return;
+    gEnrolling = YES;
+    if (_w) {
+        if (_finished) [self teardown];            // stale window from a previous run (never closed)
+        else { PFLog(@"present: setup window already active"); return; }
+    }
     _mode = mode; _finished = NO;
     CGRect b = UIScreen.mainScreen.bounds;
     CGFloat W = b.size.width, H = b.size.height;
@@ -669,6 +695,7 @@ static UIColor *PFGreen(void) { return [UIColor colorWithRed:0.19 green:0.82 blu
 }
 - (void)teardown {
     [PFScanner shared].progress = nil;
+    gEnrolling = NO;
     [_pl removeFromSuperlayer]; _pl = nil;
     _w.hidden = YES; _w = nil; _ticks = nil; _circle = nil;
 }
@@ -863,7 +890,7 @@ static BOOL PFIsLocked(void) {
 }
 
 static void PFWakeInner(void) {
-    if ([PFScanner shared].mode) return;   // already scanning
+    if ([PFScanner shared].mode || gEnrolling) return;   // already scanning / setup UI is up
     if (!PFIsLocked()) { gFails = 0; return; }
     {
         SBBacklightController *bc = [%c(SBBacklightController) sharedInstance];
@@ -940,6 +967,30 @@ static void PFRetry(void) {
 }
 %end
 
+// Settings writes the passcode pref and posts the notification back to back; the pref can reach
+// SpringBoard a moment later, so retry for ~1.6s instead of failing on the first read.
+static void PFBeginEnroll(int attempt) {
+    NSString *p = [kDir stringByAppendingPathComponent:@"passcode.tmp"];
+    NSString *pw = PFPrefGet(@"pendingPasscode");
+    if (!pw.length) pw = [NSString stringWithContentsOfFile:p encoding:NSUTF8StringEncoding error:nil];
+    if (!pw.length && attempt < 8) {
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 200 * NSEC_PER_MSEC), dispatch_get_main_queue(), ^{ PFBeginEnroll(attempt + 1); });
+        return;
+    }
+    PFPrefSet(@"pendingPasscode", nil);
+    [[NSFileManager defaultManager] removeItemAtPath:p error:nil];
+    if (!pw.length) {
+        PFStatus(@"fail: no passcode received");
+        PFPrefSet(@"status", @"Failed: no passcode received");
+        return;
+    }
+    if (gEnrolling) { PFLog(@"enroll ignored: setup already running"); return; }
+    PFLog(@"enroll requested (passcode read after %d retries)", attempt);
+    gPendingPW = pw;
+    PFPrefSet(@"status", @"Setup in progress");
+    [PFSetup begin:2];
+}
+
 %ctor {
     @autoreleasepool {
         %init;
@@ -948,20 +999,8 @@ static void PFRetry(void) {
         notify_register_dispatch("com.photoface.prefschanged", &t5, dispatch_get_main_queue(), ^(int t) { [PFLockIcon reload]; });
         static int t1, t2, t3;
         notify_register_dispatch("com.photoface.enroll", &t1, dispatch_get_main_queue(), ^(int t) {
-            NSString *p = [kDir stringByAppendingPathComponent:@"passcode.tmp"];
-            NSString *pw = PFPrefGet(@"pendingPasscode");
-            PFPrefSet(@"pendingPasscode", nil);
-            if (!pw.length) pw = [NSString stringWithContentsOfFile:p encoding:NSUTF8StringEncoding error:nil];
-            [[NSFileManager defaultManager] removeItemAtPath:p error:nil];
-            if (!pw.length) {
-                PFStatus(@"fail: no passcode received");
-                PFPrefSet(@"status", @"Failed: no passcode received");
-                return;
-            }
-            PFLog(@"enroll requested");
-            gPendingPW = pw;
-            PFPrefSet(@"status", @"Setup in progress");
-            [PFSetup begin:2];
+            PFLog(@"enroll notification received");
+            PFBeginEnroll(0);
         });
         notify_register_dispatch("com.photoface.test", &t2, dispatch_get_main_queue(), ^(int t) {
             PFLog(@"test requested");
