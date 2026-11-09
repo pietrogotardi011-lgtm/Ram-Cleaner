@@ -4,8 +4,7 @@
 #import <UIKit/UIKit.h>
 #import <AVFoundation/AVFoundation.h>
 #import <Vision/Vision.h>
-#import <CoreImage/CoreImage.h>
-#import <Metal/Metal.h>
+#import <CoreGraphics/CoreGraphics.h>
 #import <QuartzCore/QuartzCore.h>
 #import <notify.h>
 #import <float.h>
@@ -108,7 +107,7 @@ static void PFInstallCrashRecorder(void) {
 @end
 
 @implementation PFScan {
-    AVCaptureSession *_s; dispatch_queue_t _q, _cfg; CIContext *_ci; NSTimer *_wd;
+    AVCaptureSession *_s; dispatch_queue_t _q, _cfg; NSTimer *_wd;
     NSTimeInterval _startTS, _deadlineTS, _lastFrameTS, _lastProc, _lastGain;
     int _frames, _center, _secCount[8], _retries;
     NSMutableArray *_got; NSMutableArray<NSNumber *> *_bins;
@@ -121,10 +120,6 @@ static void PFInstallCrashRecorder(void) {
     if (!(self = [super init])) return nil;
     _q = dispatch_queue_create("photoface.app.cam", DISPATCH_QUEUE_SERIAL);
     _cfg = dispatch_queue_create("photoface.app.cfg", DISPATCH_QUEUE_SERIAL);
-    // contextWithOptions:nil tried to build an OpenGL context here and crashed (null deref in CI::GLContext): use Metal, else the CPU
-    id<MTLDevice> dev = MTLCreateSystemDefaultDevice();
-    _ci = dev ? [CIContext contextWithMTLDevice:dev] : [CIContext contextWithOptions:@{kCIContextUseSoftwareRenderer: @YES}];
-    PFLog(@"CIContext created (metal=%d)", dev != nil);
     _obs = [NSMutableArray new];
     return self;
 }
@@ -278,13 +273,35 @@ static void PFInstallCrashRecorder(void) {
     dispatch_async(dispatch_get_main_queue(), ^{ p(d); });
 }
 
-- (VNFeaturePrintObservation *)printFor:(CIImage *)img face:(CGRect)box {
-    CGRect r = VNImageRectForNormalizedRect(box, img.extent.size.width, img.extent.size.height);
+// Square crop around the face (1.3x), cut with plain CoreGraphics: Core Image crashed in this app (OpenGL context creation).
+- (VNFeaturePrintObservation *)printFor:(CVPixelBufferRef)pb face:(CGRect)box {
+    size_t W = CVPixelBufferGetWidth(pb), H = CVPixelBufferGetHeight(pb);
+    CGRect r = VNImageRectForNormalizedRect(box, W, H);   // origin bottom-left, same as a CG bitmap context
     CGFloat side = MAX(r.size.width, r.size.height) * 1.3;
     CGRect sq = CGRectMake(CGRectGetMidX(r) - side / 2, CGRectGetMidY(r) - side / 2, side, side);
-    sq = CGRectIntersection(sq, img.extent);
-    CGImageRef cg = [_ci createCGImage:img fromRect:sq];
+    sq = CGRectIntegral(CGRectIntersection(sq, CGRectMake(0, 0, W, H)));
+    if (sq.size.width < 8 || sq.size.height < 8) return nil;
+
+    CGImageRef cg = NULL;
+    CVPixelBufferLockBaseAddress(pb, kCVPixelBufferLock_ReadOnly);
+    CGColorSpaceRef cs = CGColorSpaceCreateDeviceRGB();
+    CGBitmapInfo bi = kCGBitmapByteOrder32Little | kCGImageAlphaPremultipliedFirst;   // BGRA
+    CGContextRef src = CGBitmapContextCreate(CVPixelBufferGetBaseAddress(pb), W, H, 8, CVPixelBufferGetBytesPerRow(pb), cs, bi);
+    CGContextRef dst = CGBitmapContextCreate(NULL, (size_t)sq.size.width, (size_t)sq.size.height, 8, 0, cs, bi);
+    if (src && dst) {
+        CGImageRef full = CGBitmapContextCreateImage(src);
+        if (full) {
+            CGContextDrawImage(dst, CGRectMake(-sq.origin.x, -sq.origin.y, W, H), full);
+            CGImageRelease(full);
+            cg = CGBitmapContextCreateImage(dst);   // owns its own pixels, safe after the buffer is unlocked
+        }
+    }
+    if (src) CGContextRelease(src);
+    if (dst) CGContextRelease(dst);
+    CGColorSpaceRelease(cs);
+    CVPixelBufferUnlockBaseAddress(pb, kCVPixelBufferLock_ReadOnly);
     if (!cg) return nil;
+
     VNGenerateImageFeaturePrintRequest *pr = [VNGenerateImageFeaturePrintRequest new];
     VNImageRequestHandler *h = [[VNImageRequestHandler alloc] initWithCGImage:cg options:@{}];
     BOOL ok = [h performRequests:@[pr] error:nil];
@@ -312,8 +329,6 @@ static void PFInstallCrashRecorder(void) {
     else { f = faces[0]; if (f.boundingBox.size.width < 0.3) hint = @"Move a little closer."; }
     if (hint) { [self report:@{@"hint": hint, @"face": @NO}]; return; }
 
-    CIImage *img = [CIImage imageWithCVPixelBuffer:pb];
-
     if (mode == 2) {
         float yaw = NAN, pitch = NAN;
         if (f.yaw) yaw = f.yaw.floatValue;
@@ -327,7 +342,7 @@ static void PFInstallCrashRecorder(void) {
         }
         BOOL need = (bin == -1) ? (_center < 4) : (_secCount[bin] < 2);
         if (need) {
-            VNFeaturePrintObservation *fp = [self printFor:img face:f.boundingBox];
+            VNFeaturePrintObservation *fp = [self printFor:pb face:f.boundingBox];
             if (fp) {
                 [_got addObject:fp]; [_bins addObject:@(bin)];
                 if (bin == -1) _center++; else _secCount[bin]++;
@@ -345,7 +360,7 @@ static void PFInstallCrashRecorder(void) {
         return;
     }
 
-    VNFeaturePrintObservation *fp = [self printFor:img face:f.boundingBox];
+    VNFeaturePrintObservation *fp = [self printFor:pb face:f.boundingBox];
     if (!fp) return;
     float best = FLT_MAX;
     for (VNFeaturePrintObservation *p in _db[@"prints"]) {
