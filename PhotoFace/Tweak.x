@@ -198,6 +198,21 @@ static void PFEnrollAbort(NSString *why) {
     PFPrefSet(@"status", [@"Failed: " stringByAppendingString:why]);
 }
 
+// Last resort: lock the phone. That always backgrounds Settings, and the lock screen is where verify already gets the camera.
+static BOOL PFLockAndWake(void) {
+    id lm = [%c(SBLockScreenManager) sharedInstance];
+    SEL l = NSSelectorFromString(@"lockUIFromSource:withOptions:");
+    if (!lm || ![lm respondsToSelector:l]) { PFLog(@"lock fallback: lockUIFromSource:withOptions: missing"); return NO; }
+    ((void (*)(id, SEL, int, id))objc_msgSend)(lm, l, 1, nil);
+    PFLog(@"lock fallback: locked the device");
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 1200 * NSEC_PER_MSEC), dispatch_get_main_queue(), ^{
+        SBBacklightController *b = [%c(SBBacklightController) sharedInstance];
+        if ([b respondsToSelector:@selector(turnOnScreenFullyWithBacklightSource:)]) [b turnOnScreenFullyWithBacklightSource:0];
+        PFLog(@"lock fallback: woke screen");
+    });
+    return YES;
+}
+
 static NSDictionary *PFLoadDB(void) {
     NSData *d = [NSData dataWithContentsOfFile:PFDBPath()];
     if (!d) return nil;
@@ -568,14 +583,23 @@ static float PFLimit(NSDictionary *db) {
     if (gEnrolling) { PFLog(@"begin(%d): setup already running, ignoring", mode); return; }
     gEnrolling = YES;
     PFLogEnv("before-home");
-    if (!PFGoHome()) { PFEnrollAbort(@"couldn't leave Settings (no home-button action on this iOS, see log)"); return; }
+    if (!PFGoHome()) {
+        if (!PFLockAndWake()) { PFEnrollAbort(@"couldn't leave Settings (no home or lock action on this iOS, see log)"); return; }
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 2400 * NSEC_PER_MSEC), dispatch_get_main_queue(), ^{ [[PFSetup shared] present:mode]; });
+        return;
+    }
     [self awaitHome:mode tries:0];
 }
 + (void)awaitHome:(int)mode tries:(int)n {
     // the camera stays "in use" by Settings until it is backgrounded, so poll instead of guessing a delay
     NSString *fa = PFFrontApp();
     BOOL clear = [fa hasPrefix:@"(none"] || [fa hasPrefix:@"(selector"] || [fa hasPrefix:@"(exception"];
-    if (!clear && n >= 20) { PFEnrollAbort([NSString stringWithFormat:@"still in %@ after pressing Home", fa]); return; }
+    if (!clear && n >= 20) {
+        PFLog(@"still in %@ after pressing Home - using lock fallback", fa);
+        if (!PFLockAndWake()) { PFEnrollAbort([NSString stringWithFormat:@"still in %@ after pressing Home", fa]); return; }
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 2400 * NSEC_PER_MSEC), dispatch_get_main_queue(), ^{ [[PFSetup shared] present:mode]; });
+        return;
+    }
     if (clear) {
         PFLog(@"home reached (frontApp=%@, waited %dms)", fa, n * 200);
         dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 350 * NSEC_PER_MSEC), dispatch_get_main_queue(), ^{ [[PFSetup shared] present:mode]; });
