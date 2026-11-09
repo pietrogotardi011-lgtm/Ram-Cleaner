@@ -5,7 +5,7 @@ include $(THEOS)/makefiles/common.mk
 
 APPLICATION_NAME = PhotoFaceEnroll
 PhotoFaceEnroll_FILES = main.m
-PhotoFaceEnroll_FRAMEWORKS = UIKit AVFoundation Vision CoreImage CoreMedia CoreVideo QuartzCore
+PhotoFaceEnroll_FRAMEWORKS = UIKit AVFoundation Vision CoreImage CoreMedia CoreVideo QuartzCore Metal
 PhotoFaceEnroll_CFLAGS = -fobjc-arc
 PhotoFaceEnroll_CODESIGN_FLAGS = -Sentitlements.plist
 

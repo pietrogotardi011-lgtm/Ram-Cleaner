@@ -5,6 +5,7 @@
 #import <AVFoundation/AVFoundation.h>
 #import <Vision/Vision.h>
 #import <CoreImage/CoreImage.h>
+#import <Metal/Metal.h>
 #import <QuartzCore/QuartzCore.h>
 #import <notify.h>
 #import <float.h>
@@ -120,7 +121,10 @@ static void PFInstallCrashRecorder(void) {
     if (!(self = [super init])) return nil;
     _q = dispatch_queue_create("photoface.app.cam", DISPATCH_QUEUE_SERIAL);
     _cfg = dispatch_queue_create("photoface.app.cfg", DISPATCH_QUEUE_SERIAL);
-    _ci = [CIContext contextWithOptions:nil];
+    // contextWithOptions:nil tried to build an OpenGL context here and crashed (null deref in CI::GLContext): use Metal, else the CPU
+    id<MTLDevice> dev = MTLCreateSystemDefaultDevice();
+    _ci = dev ? [CIContext contextWithMTLDevice:dev] : [CIContext contextWithOptions:@{kCIContextUseSoftwareRenderer: @YES}];
+    PFLog(@"CIContext created (metal=%d)", dev != nil);
     _obs = [NSMutableArray new];
     return self;
 }
