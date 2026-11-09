@@ -10,6 +10,7 @@
 #import <float.h>
 #import <math.h>
 #import <sys/stat.h>
+#import <objc/message.h>
 
 static NSString *const kDir = @"/var/mobile/Library/PhotoFace";
 static CFStringRef const kPrefDom = CFSTR("com.photoface.tweak");
@@ -507,7 +508,8 @@ static float PFLimit(NSDictionary *db) {
 - (void)leave {
     _running = NO;
     UIApplication *app = [UIApplication sharedApplication];
-    if ([app respondsToSelector:NSSelectorFromString(@"suspend")]) [app performSelector:NSSelectorFromString(@"suspend")];
+    SEL sus = NSSelectorFromString(@"suspend");
+    if ([app respondsToSelector:sus]) ((void (*)(id, SEL))objc_msgSend)(app, sus);
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 700 * NSEC_PER_MSEC), dispatch_get_main_queue(), ^{ exit(0); });
 }
 @end
