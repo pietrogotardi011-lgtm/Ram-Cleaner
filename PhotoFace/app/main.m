@@ -11,6 +11,10 @@
 #import <math.h>
 #import <sys/stat.h>
 #import <objc/message.h>
+#import <execinfo.h>
+#import <signal.h>
+#import <fcntl.h>
+#import <unistd.h>
 
 static NSString *const kDir = @"/var/mobile/Library/PhotoFace";
 static CFStringRef const kPrefDom = CFSTR("com.photoface.tweak");
@@ -67,6 +71,29 @@ static float PFLimit(NSDictionary *db) {
     float tol = tv ? [tv floatValue] : 1.25f;
     if (tol < 0.5f || tol > 2.0f) tol = 1.25f;
     return base * tol;
+}
+
+
+#pragma mark - crash recorder (writes into log.txt so the next run can show what killed the app)
+
+static void PFCrashSignal(int sig) {
+    int fd = open("/var/mobile/Library/PhotoFace/log.txt", O_WRONLY | O_APPEND | O_CREAT, 0600);
+    if (fd >= 0) {
+        char head[64]; int n = snprintf(head, sizeof head, "[app] CRASH signal %d\n", sig);
+        write(fd, head, n);
+        void *bt[24]; int c = backtrace(bt, 24);
+        backtrace_symbols_fd(bt, c, fd);
+        close(fd);
+    }
+    signal(sig, SIG_DFL); raise(sig);
+}
+static void PFCrashException(NSException *e) {
+    PFLog(@"CRASH exception %@: %@\n%@", e.name, e.reason, [[e callStackSymbols] componentsJoinedByString:@"\n"]);
+}
+static void PFInstallCrashRecorder(void) {
+    NSSetUncaughtExceptionHandler(&PFCrashException);
+    int sigs[] = { SIGSEGV, SIGABRT, SIGBUS, SIGILL, SIGTRAP, SIGFPE };
+    for (size_t i = 0; i < sizeof sigs / sizeof *sigs; i++) signal(sigs[i], PFCrashSignal);
 }
 
 #pragma mark - scanner (enroll = 2, test = 3)
@@ -429,6 +456,7 @@ static float PFLimit(NSDictionary *db) {
 }
 
 - (void)startMode:(int)mode {
+    PFLog(@"startMode %d begin", mode);
     if ([self isRunning]) return;
     _mode = mode; _running = YES; _finished = NO;
     [_pl removeFromSuperlayer]; _pl = nil;
@@ -448,6 +476,7 @@ static float PFLimit(NSDictionary *db) {
     __weak PFVC *ws = self;
     _scan.progress = ^(NSDictionary *i) { [ws update:i]; };
     [_scan start:mode timeout:(mode == 2 ? 75 : 90) done:^(BOOL ok, NSString *info) { [ws finished:ok info:info]; }];
+    PFLog(@"startMode: scan started, attaching preview");
     [self attachPreview];
     // the session can be rebuilt on a retry; keep the preview attached
     [NSTimer scheduledTimerWithTimeInterval:0.5 repeats:YES block:^(NSTimer *t) {
@@ -506,6 +535,7 @@ static float PFLimit(NSDictionary *db) {
 
 // go back to the Home Screen and drop the process so the camera is released
 - (void)leave {
+    PFLog(@"leave: going home and exiting");
     _running = NO;
     UIApplication *app = [UIApplication sharedApplication];
     SEL sus = NSSelectorFromString(@"suspend");
@@ -528,7 +558,8 @@ static float PFLimit(NSDictionary *db) {
     _vc = [PFVC new];
     self.window.rootViewController = _vc;
     [self.window makeKeyAndVisible];
-    PFLog(@"app launched appState=%ld", (long)app.applicationState);
+    PFInstallCrashRecorder();
+    PFLog(@"app launched appState=%ld pid=%d", (long)app.applicationState, getpid());
     return YES;
 }
 - (void)applicationDidBecomeActive:(UIApplication *)app {
@@ -541,7 +572,10 @@ static float PFLimit(NSDictionary *db) {
     // small pause so the app is fully frontmost before the camera starts
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 400 * NSEC_PER_MSEC), dispatch_get_main_queue(), ^{ [self->_vc startMode:mode]; });
 }
+- (void)applicationWillResignActive:(UIApplication *)app { PFLog(@"app will resign active"); }
+- (void)applicationWillTerminate:(UIApplication *)app { PFLog(@"app will terminate"); }
 - (void)applicationDidEnterBackground:(UIApplication *)app {
+    PFLog(@"app entered background (scan running: %d)", [_vc isRunning]);
     if ([_vc isRunning]) { PFLog(@"app went to background mid-scan, cancelling"); [_vc abortIfRunning]; }
 }
 @end
