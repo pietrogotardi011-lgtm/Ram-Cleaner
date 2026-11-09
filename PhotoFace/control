@@ -1,6 +1,6 @@
 Package: com.photoface.tweak
 Name: PhotoFace
-Version: 0.2.3
+Version: 0.2.4
 Architecture: iphoneos-arm
 Description: On-device photo-based face unlock for iPhones without Face ID
 Icon: file:///Library/PreferenceBundles/PhotoFacePrefs.bundle/package-icon.png

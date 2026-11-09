@@ -28,6 +28,10 @@
 - (BOOL)screenIsDim;
 - (void)turnOnScreenFullyWithBacklightSource:(long long)source;
 @end
+@interface SBUIController : NSObject
++ (instancetype)sharedInstance;
+- (void)clickedMenuButton;
+@end
 @interface SpringBoard : UIApplication
 - (void)_simulateHomeButtonPress;
 @end
@@ -138,6 +142,31 @@ static NSString *PFGuardPath(void) { return [kDir stringByAppendingPathComponent
 static void PFGuardBegin(void) { [@"1" writeToFile:PFGuardPath() atomically:NO encoding:NSUTF8StringEncoding error:nil]; }
 static void PFGuardEnd(void) { [[NSFileManager defaultManager] removeItemAtPath:PFGuardPath() error:nil]; }
 
+// _simulateHomeButtonPress does not exist on iOS 15 (log showed homePressSel=0), so Settings never left the front.
+static BOOL PFGoHome(void) {
+    UIApplication *app = [UIApplication sharedApplication];
+    SEL a = NSSelectorFromString(@"_simulateHomeButtonPress");
+    if ([app respondsToSelector:a]) { ((void (*)(id, SEL))objc_msgSend)(app, a); PFLog(@"home via _simulateHomeButtonPress"); return YES; }
+    id ui = [%c(SBUIController) sharedInstance];
+    SEL b = NSSelectorFromString(@"clickedMenuButton");
+    if (ui && [ui respondsToSelector:b]) { ((void (*)(id, SEL))objc_msgSend)(ui, b); PFLog(@"home via SBUIController clickedMenuButton"); return YES; }
+    PFLog(@"home: no usable home-button selector found");
+    return NO;
+}
+static void PFDumpHomeSelectors(void) {
+    const char *names[] = { "SpringBoard", "SBUIController", "SBHomeHardwareButtonActions", "SBMainSwitcherViewController" };
+    for (int i = 0; i < 4; i++) {
+        Class c = objc_getClass(names[i]); if (!c) { PFLog(@"home-api %s: (class missing)", names[i]); continue; }
+        NSMutableArray *hits = [NSMutableArray new]; unsigned n = 0;
+        Method *ms = class_copyMethodList(c, &n);
+        for (unsigned k = 0; k < n; k++) {
+            NSString *nm = NSStringFromSelector(method_getName(ms[k])), *l = nm.lowercaseString;
+            if ([l containsString:@"menubutton"] || [l containsString:@"homebutton"] || [l containsString:@"dismissswitcher"] || [l containsString:@"gohome"]) [hits addObject:nm];
+        }
+        free(ms);
+        PFLog(@"home-api %s: %@", names[i], [hits componentsJoinedByString:@" "]);
+    }
+}
 static NSDictionary *PFQ(void) {
     return @{(id)kSecClass: (id)kSecClassGenericPassword,
              (id)kSecAttrService: kService, (id)kSecAttrAccount: @"pw"};
@@ -162,6 +191,13 @@ static void PFStatus(NSString *s) {   // status file for the pfenroll CLI
     [s writeToFile:p atomically:YES encoding:NSUTF8StringEncoding error:nil];
     chmod(p.fileSystemRepresentation, 0644);
 }
+static void PFEnrollAbort(NSString *why) {
+    gEnrolling = NO;
+    PFLog(@"enroll aborted: %@", why);
+    PFStatus([@"fail: " stringByAppendingString:why]);
+    PFPrefSet(@"status", [@"Failed: " stringByAppendingString:why]);
+}
+
 static NSDictionary *PFLoadDB(void) {
     NSData *d = [NSData dataWithContentsOfFile:PFDBPath()];
     if (!d) return nil;
@@ -531,16 +567,16 @@ static float PFLimit(NSDictionary *db) {
 + (void)begin:(int)mode {
     if (gEnrolling) { PFLog(@"begin(%d): setup already running, ignoring", mode); return; }
     gEnrolling = YES;
-    id app = [UIApplication sharedApplication];
     PFLogEnv("before-home");
-    if ([app respondsToSelector:@selector(_simulateHomeButtonPress)]) [(SpringBoard *)app _simulateHomeButtonPress];
+    if (!PFGoHome()) { PFEnrollAbort(@"couldn't leave Settings (no home-button action on this iOS, see log)"); return; }
     [self awaitHome:mode tries:0];
 }
 + (void)awaitHome:(int)mode tries:(int)n {
     // the camera stays "in use" by Settings until it is backgrounded, so poll instead of guessing a delay
     NSString *fa = PFFrontApp();
     BOOL clear = [fa hasPrefix:@"(none"] || [fa hasPrefix:@"(selector"] || [fa hasPrefix:@"(exception"];
-    if (clear || n >= 20) {
+    if (!clear && n >= 20) { PFEnrollAbort([NSString stringWithFormat:@"still in %@ after pressing Home", fa]); return; }
+    if (clear) {
         PFLog(@"home reached (frontApp=%@, waited %dms)", fa, n * 200);
         dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 350 * NSEC_PER_MSEC), dispatch_get_main_queue(), ^{ [[PFSetup shared] present:mode]; });
         return;
@@ -1047,5 +1083,6 @@ static void PFBeginEnroll(int attempt) {
         }
         PFLog(@"PhotoFace loaded in SpringBoard");
         PFDumpCameraSwitches();
+        PFDumpHomeSelectors();
     }
 }
