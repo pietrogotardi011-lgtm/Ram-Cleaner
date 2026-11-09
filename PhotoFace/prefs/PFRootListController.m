@@ -68,7 +68,7 @@ static void PFSet(NSString *k, id v) {
         self->_ticks++;
         NSString *st = PFGet(@"status") ?: @"";
         if (![st isEqualToString:last]) { last = st; [self reloadSpecifiers]; }
-        if ([st hasPrefix:@"Starting"] && self->_ticks > 8) {
+        if ([st hasPrefix:@"Starting"] && self->_ticks > 24) {
             [t invalidate];
             PFSet(@"status", @"Failed: tweak not responding");
             [self reloadSpecifiers];
