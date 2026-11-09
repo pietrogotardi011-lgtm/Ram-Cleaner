@@ -12,6 +12,7 @@
 #import <objc/runtime.h>
 #import <objc/message.h>
 #import <mach-o/dyld.h>
+#import <signal.h>
 
 @interface SBLockScreenManager : NSObject
 + (instancetype)sharedInstance;
@@ -31,6 +32,10 @@
 @interface SBUIController : NSObject
 + (instancetype)sharedInstance;
 - (void)clickedMenuButton;
+@end
+@interface FBSSystemService : NSObject
++ (instancetype)sharedService;
+- (void)terminateApplication:(NSString *)bundleID forReason:(long long)reason andReport:(BOOL)report withDescription:(NSString *)desc;
 @end
 @interface SpringBoard : UIApplication
 - (void)_simulateHomeButtonPress;
@@ -96,18 +101,27 @@ static void PFLog(NSString *fmt, ...) {
 }
 
 // ---- diagnostics: who is in front, and what camera "background" switches exist ----
-static NSString *PFFrontApp(void) {
+static id PFFrontAppObj(void) {
     @try {
         id app = [UIApplication sharedApplication];
         SEL sel = NSSelectorFromString(@"_accessibilityFrontMostApplication");
-        if (![app respondsToSelector:sel]) return @"(selector missing)";
-        id fa = ((id (*)(id, SEL))objc_msgSend)(app, sel);
-        if (!fa) return @"(none: SpringBoard/home or lock screen)";
-        id bid = nil;
-        @try { bid = [fa valueForKey:@"bundleIdentifier"]; } @catch (...) {}
-        if (!bid) { @try { bid = [fa valueForKey:@"displayIdentifier"]; } @catch (...) {} }
-        return bid ? [NSString stringWithFormat:@"%@", bid] : @"(unknown app)";
-    } @catch (NSException *e) { return @"(exception)"; }
+        if (![app respondsToSelector:sel]) return nil;
+        return ((id (*)(id, SEL))objc_msgSend)(app, sel);
+    } @catch (NSException *e) { return nil; }
+}
+static NSString *PFFrontAppID(void) {   // nil = nothing in front (home screen / lock screen)
+    id fa = PFFrontAppObj();
+    if (!fa) return nil;
+    id bid = nil;
+    @try { bid = [fa valueForKey:@"bundleIdentifier"]; } @catch (...) {}
+    if (!bid) { @try { bid = [fa valueForKey:@"displayIdentifier"]; } @catch (...) {} }
+    return [bid isKindOfClass:NSString.class] ? bid : @"(unknown app)";
+}
+static NSString *PFFrontApp(void) {
+    id app = [UIApplication sharedApplication];
+    if (![app respondsToSelector:NSSelectorFromString(@"_accessibilityFrontMostApplication")]) return @"(selector missing)";
+    NSString *b = PFFrontAppID();
+    return b ?: @"(none: SpringBoard/home or lock screen)";
 }
 static void PFLogEnv(const char *tag) {
     UIApplication *app = [UIApplication sharedApplication];
@@ -198,19 +212,23 @@ static void PFEnrollAbort(NSString *why) {
     PFPrefSet(@"status", [@"Failed: " stringByAppendingString:why]);
 }
 
-// Last resort: lock the phone. That always backgrounds Settings, and the lock screen is where verify already gets the camera.
-static BOOL PFLockAndWake(void) {
-    id lm = [%c(SBLockScreenManager) sharedInstance];
-    SEL l = NSSelectorFromString(@"lockUIFromSource:withOptions:");
-    if (!lm || ![lm respondsToSelector:l]) { PFLog(@"lock fallback: lockUIFromSource:withOptions: missing"); return NO; }
-    ((void (*)(id, SEL, int, id))objc_msgSend)(lm, l, 1, nil);
-    PFLog(@"lock fallback: locked the device");
-    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 1200 * NSEC_PER_MSEC), dispatch_get_main_queue(), ^{
-        SBBacklightController *b = [%c(SBBacklightController) sharedInstance];
-        if ([b respondsToSelector:@selector(turnOnScreenFullyWithBacklightSource:)]) [b turnOnScreenFullyWithBacklightSource:0];
-        PFLog(@"lock fallback: woke screen");
-    });
-    return YES;
+// Force the foreground app (Settings) away. Kills it through FrontBoard, which drops back to the home screen.
+static BOOL PFCloseFrontApp(NSString *bid) {
+    if (!bid.length || [bid isEqualToString:@"com.apple.springboard"]) return NO;
+    id svc = [%c(FBSSystemService) sharedService];
+    SEL t = NSSelectorFromString(@"terminateApplication:forReason:andReport:withDescription:");
+    if (svc && [svc respondsToSelector:t]) {
+        ((void (*)(id, SEL, id, long long, BOOL, id))objc_msgSend)(svc, t, bid, 1, NO, @"PhotoFace setup");
+        PFLog(@"close: FBSSystemService terminated %@", bid);
+        return YES;
+    }
+    @try {   // fallback: kill the process directly
+        id fa = PFFrontAppObj();
+        int pid = [[fa valueForKey:@"pid"] intValue];
+        if (pid > 1) { kill(pid, SIGKILL); PFLog(@"close: kill(%d) for %@", pid, bid); return YES; }
+    } @catch (NSException *e) {}
+    PFLog(@"close: no way to terminate %@", bid);
+    return NO;
 }
 
 static NSDictionary *PFLoadDB(void) {
@@ -583,26 +601,21 @@ static float PFLimit(NSDictionary *db) {
     if (gEnrolling) { PFLog(@"begin(%d): setup already running, ignoring", mode); return; }
     gEnrolling = YES;
     PFLogEnv("before-home");
-    if (!PFGoHome()) {
-        if (!PFLockAndWake()) { PFEnrollAbort(@"couldn't leave Settings (no home or lock action on this iOS, see log)"); return; }
-        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 2400 * NSEC_PER_MSEC), dispatch_get_main_queue(), ^{ [[PFSetup shared] present:mode]; });
-        return;
-    }
     [self awaitHome:mode tries:0];
 }
+// Settings normally suspends itself (prefs bundle). If anything is still in front we ask for Home,
+// then close it through FrontBoard. We never lock the device: the setup UI can't show there.
 + (void)awaitHome:(int)mode tries:(int)n {
-    // the camera stays "in use" by Settings until it is backgrounded, so poll instead of guessing a delay
-    NSString *fa = PFFrontApp();
-    BOOL clear = [fa hasPrefix:@"(none"] || [fa hasPrefix:@"(selector"] || [fa hasPrefix:@"(exception"];
-    if (!clear && n >= 20) {
-        PFLog(@"still in %@ after pressing Home - using lock fallback", fa);
-        if (!PFLockAndWake()) { PFEnrollAbort([NSString stringWithFormat:@"still in %@ after pressing Home", fa]); return; }
-        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 2400 * NSEC_PER_MSEC), dispatch_get_main_queue(), ^{ [[PFSetup shared] present:mode]; });
+    NSString *fid = PFFrontAppID();
+    if (!fid) {
+        PFLog(@"home reached (waited %dms)", n * 200);
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (n ? 500 : 350) * NSEC_PER_MSEC), dispatch_get_main_queue(), ^{ [[PFSetup shared] present:mode]; });
         return;
     }
-    if (clear) {
-        PFLog(@"home reached (frontApp=%@, waited %dms)", fa, n * 200);
-        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 350 * NSEC_PER_MSEC), dispatch_get_main_queue(), ^{ [[PFSetup shared] present:mode]; });
+    if (n == 0) { PFLog(@"front app is %@, trying Home", fid); PFGoHome(); }
+    if (n == 5 || n == 15) PFCloseFrontApp(fid);   // ~1s and ~3s: Home didn't work, close the app
+    if (n >= 40) {
+        PFEnrollAbort([NSString stringWithFormat:@"couldn't close %@ (see log)", fid]);
         return;
     }
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 200 * NSEC_PER_MSEC), dispatch_get_main_queue(), ^{ [self awaitHome:mode tries:n + 1]; });

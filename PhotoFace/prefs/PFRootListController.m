@@ -19,6 +19,18 @@ static void PFSet(NSString *k, id v) {
     CFPreferencesAppSynchronize(kDom);
 }
 
+@interface UIApplication (PFPrivate)
+- (void)suspend;
+@end
+
+// Send Settings to the Home Screen (same as pressing Home) so SpringBoard can use the camera and show the setup UI.
+static void PFLeaveSettings(void) {
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 300 * NSEC_PER_MSEC), dispatch_get_main_queue(), ^{
+        UIApplication *app = [UIApplication sharedApplication];
+        if ([app respondsToSelector:@selector(suspend)]) [app suspend];
+    });
+}
+
 @interface PFRootListController : PSListController
 @end
 
@@ -50,11 +62,13 @@ static void PFSet(NSString *k, id v) {
         notify_post("com.photoface.enroll");
         [self reloadSpecifiers];
         [self startPolling];
+        PFLeaveSettings();
     }]];
     [self presentViewController:a animated:YES completion:nil];
 }
 - (void)testRecognition:(PSSpecifier *)s {
     notify_post("com.photoface.test");
+    PFLeaveSettings();
 }
 - (void)alert:(NSString *)t msg:(NSString *)m {
     UIAlertController *a = [UIAlertController alertControllerWithTitle:t message:m preferredStyle:UIAlertControllerStyleAlert];
