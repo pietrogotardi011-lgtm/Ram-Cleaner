@@ -18,8 +18,12 @@
 
 static NSString *const kDir = @"/var/mobile/Library/PhotoFace";
 static CFStringRef const kPrefDom = CFSTR("com.photoface.tweak");
-#define kNeedCenter 6   // straight-ahead samples
-#define kNeedPer 2      // samples per head direction (8 directions)
+#define kNeedCenter 6   // straight-ahead samples per scan
+#define kNeedPer 2      // samples per head direction (8 directions) per scan
+#define kScans 2        // Face ID style: two passes around the circle
+#define kScanSeconds 55 // time limit for one pass (the whole flow must stay under the tweak's 200 s watchdog)
+#define kShowLivePreview 1   // 1 = live camera view inside the circle (like Face ID, nothing is ever saved as an image); 0 = dark circle + ring only
+#define kTicks 72
 
 #pragma mark - helpers
 
@@ -47,7 +51,8 @@ static void PFWriteStatus(NSString *s) {
     chmod(p.fileSystemRepresentation, 0644);
 }
 static UIColor *PFGreen(void) { return [UIColor colorWithRed:0.19 green:0.82 blue:0.35 alpha:1]; }
-static UIColor *PFDim(void) { return [UIColor colorWithRed:0.19 green:0.82 blue:0.35 alpha:0.28]; }   // always-visible ring track
+static UIColor *PFTrack(void) { return [UIColor colorWithWhite:1 alpha:0.22]; }   // ring track
+static UIColor *PFBlue(void) { return [UIColor colorWithRed:0.04 green:0.52 blue:1 alpha:1]; }
 
 static NSDictionary *PFLoadDB(void) {
     NSData *d = [NSData dataWithContentsOfFile:PFDBPath()];
@@ -106,17 +111,20 @@ static void PFInstallCrashRecorder(void) {
 @property (nonatomic, readonly) AVCaptureSession *session;
 @property (nonatomic, copy) void (^progress)(NSDictionary *info);
 - (void)start:(int)mode timeout:(NSTimeInterval)t done:(void (^)(BOOL, NSString *))done;
+- (void)nextScan;   // enroll: begin the second pass
 - (void)cancel;
 @end
 
 @implementation PFScan {
     AVCaptureSession *_s; dispatch_queue_t _q, _cfg; NSTimer *_wd;
-    NSTimeInterval _startTS, _deadlineTS, _lastFrameTS, _lastProc, _lastGain;
-    int _frames, _center, _secCount[8], _retries;
-    NSMutableArray *_got; NSMutableArray<NSNumber *> *_bins;
+    NSTimeInterval _startTS, _deadlineTS, _lastFrameTS, _lastProc, _lastGain, _scanStart, _lastCap, _lastDbg;
+    int _frames, _retries;
+    NSMutableArray *_got; NSMutableArray<NSNumber *> *_bins, *_scanOf;
     NSDictionary *_db; void (^_done)(BOOL, NSString *);
     NSString *_interrupt; NSMutableArray *_obs;
-    float _biasX, _biasY, _cSumX, _cSumY; int _cN, _lastSec; NSTimeInterval _lastCap; BOOL _lmBroken, _rectErrLogged, _haveRef; float _refX, _refY; int _stableN;
+    // enroll engine (touched only on _q)
+    int _scanIdx, _phase, _center, _secCount[8], _lastSec, _cN;   // _phase: 0 find face, 1 circle, 2 paused between passes, 3 finishing
+    float _biasX, _biasY, _cSumX, _cSumY; BOOL _lmBroken, _rectErrLogged;
 }
 @synthesize session = _s;
 
@@ -187,6 +195,12 @@ static void PFInstallCrashRecorder(void) {
     return nil;
 }
 
+- (void)resetScanState {   // per-pass counters (the collected prints are kept)
+    _center = 0; memset(_secCount, 0, sizeof _secCount);
+    _biasX = _biasY = _cSumX = _cSumY = 0; _cN = 0; _lastSec = -1; _lastCap = 0;
+    _phase = 0; _scanStart = CACurrentMediaTime(); _lastGain = _scanStart;
+}
+
 - (void)start:(int)mode timeout:(NSTimeInterval)t done:(void (^)(BOOL, NSString *))done {
     if (self.mode) { done(NO, @"busy"); return; }
     if (mode == 3) {
@@ -206,11 +220,12 @@ static void PFInstallCrashRecorder(void) {
         }];
         return;
     }
-    _done = [done copy]; _center = 0; memset(_secCount, 0, sizeof _secCount);
-    _got = [NSMutableArray new]; _bins = [NSMutableArray new];
-    _frames = 0; _interrupt = nil; _lastProc = 0; _retries = 0;
-    _biasX = _biasY = _cSumX = _cSumY = 0; _cN = 0; _lastSec = -1; _lastCap = 0; _lmBroken = NO; _rectErrLogged = NO; _haveRef = NO; _stableN = 0;
-    _startTS = CACurrentMediaTime(); _lastFrameTS = _startTS; _lastGain = _startTS;
+    _done = [done copy];
+    _got = [NSMutableArray new]; _bins = [NSMutableArray new]; _scanOf = [NSMutableArray new];
+    _frames = 0; _interrupt = nil; _lastProc = 0; _retries = 0; _lastDbg = 0; _scanIdx = 0;
+    _lmBroken = NO; _rectErrLogged = NO;
+    [self resetScanState];
+    _startTS = CACurrentMediaTime(); _lastFrameTS = _startTS;
     _deadlineTS = _startTS + t;
     NSString *err = [self build];
     self.mode = mode;
@@ -218,6 +233,17 @@ static void PFInstallCrashRecorder(void) {
     [self launchSession];
     [_wd invalidate];
     _wd = [NSTimer scheduledTimerWithTimeInterval:0.5 target:self selector:@selector(tick) userInfo:nil repeats:YES];
+}
+
+// Second pass around the circle (enroll only). Runs on the camera queue so it never races with a frame.
+- (void)nextScan {
+    dispatch_async(_q, ^{
+        if (self.mode != 2) return;
+        self->_scanIdx = 1;
+        [self resetScanState];
+        self->_deadlineTS = CACurrentMediaTime() + kScanSeconds;
+        PFLog(@"second scan started");
+    });
 }
 
 - (void)launchSession {
@@ -251,6 +277,7 @@ static void PFInstallCrashRecorder(void) {
     if (_frames > 0 && n - _lastFrameTS > 3) { [self finish:NO info:@"the camera stopped"]; return; }
     if (n > _deadlineTS) {
         if (self.mode == 3) [self finish:YES info:@"test ended"];
+        else if (_phase == 2) [self finish:NO info:@"cancelled"];   // walked away between the two scans
         else [self finish:NO info:@"setup timed out before enough face angles were captured"];
     }
 }
@@ -269,16 +296,14 @@ static void PFInstallCrashRecorder(void) {
     dispatch_async(dispatch_get_main_queue(), ^{ if (d) d(ok, info); });
 }
 
-- (void)report:(NSDictionary *)extra {
+- (void)report:(NSDictionary *)d {
     void (^p)(NSDictionary *) = self.progress;
     if (!p) return;
-    NSMutableDictionary *d = [NSMutableDictionary dictionaryWithDictionary:extra];
-    int secUnits = 0; for (int k = 0; k < 8; k++) secUnits += MIN(_secCount[k], 2);
-    d[@"units"] = @(MIN(_center, 4) + MIN(secUnits, 12));
     dispatch_async(dispatch_get_main_queue(), ^{ p(d); });
 }
 
 // Square crop around the face (1.3x), cut with plain CoreGraphics: Core Image crashed in this app (OpenGL context creation).
+// The geometry must stay identical to PFScanner printFor: in Tweak.x, so enrolled and live prints are comparable.
 - (VNFeaturePrintObservation *)printFor:(CVPixelBufferRef)pb face:(CGRect)box {
     size_t W = CVPixelBufferGetWidth(pb), H = CVPixelBufferGetHeight(pb);
     CGRect r = VNImageRectForNormalizedRect(box, W, H);   // origin bottom-left, same as a CG bitmap context
@@ -307,6 +332,7 @@ static void PFInstallCrashRecorder(void) {
     CVPixelBufferUnlockBaseAddress(pb, kCVPixelBufferLock_ReadOnly);
     if (!cg) return nil;
 
+    // The crop only lives in memory for this request. No image is ever written anywhere; only the feature print is kept.
     VNGenerateImageFeaturePrintRequest *pr = [VNGenerateImageFeaturePrintRequest new];
     VNImageRequestHandler *h = [[VNImageRequestHandler alloc] initWithCGImage:cg options:@{}];
     BOOL ok = [h performRequests:@[pr] error:nil];
@@ -319,6 +345,7 @@ static void PFInstallCrashRecorder(void) {
     _frames++; _lastFrameTS = now;
     int mode = self.mode;
     if (!mode) return;
+    if (mode == 2 && _phase >= 2) return;   // paused between passes, or finishing
     if (now - _lastProc < 0.15) return;
     _lastProc = now;
     CVPixelBufferRef pb = CMSampleBufferGetImageBuffer(sb);
@@ -344,76 +371,15 @@ static void PFInstallCrashRecorder(void) {
         fr = rr;
     }
     NSArray *faces = fr.results;
+
+    if (mode == 2) { [self enrollFrame:pb faces:faces conn:c now:now]; return; }
+
+    // ---- test mode: live match score against the enrolled face ----
     NSString *hint = nil; VNFaceObservation *f = nil;
     if (faces.count == 0) hint = @"Can't see your face.\nLook at the front camera.";
     else if (faces.count > 1) hint = @"Only one face in view, please.";
     else { f = faces[0]; if (f.boundingBox.size.width < 0.3) hint = @"Move a little closer."; }
     if (hint) { [self report:@{@"hint": hint, @"face": @NO}]; return; }
-
-    if (mode == 2) {
-        // Head direction from where the nose sits inside the face (screen space: x right, y up). Works whatever
-        // the signs of Vision's yaw/pitch are, and matches what the user sees in the mirrored preview.
-        float px = 0, py = 0; BOOL havePose = NO;
-        VNFaceLandmarks2D *lm = f.landmarks;
-        if (lm && lm.nose && lm.allPoints && lm.nose.pointCount > 0 && lm.allPoints.pointCount > 0) {
-            const CGPoint *np = lm.nose.normalizedPoints, *ap = lm.allPoints.normalizedPoints;
-            size_t nc = lm.nose.pointCount, ac = lm.allPoints.pointCount;
-            float nx = 0, ny = 0, ax = 0, ay = 0;
-            for (size_t i = 0; i < nc; i++) { nx += np[i].x; ny += np[i].y; }
-            for (size_t i = 0; i < ac; i++) { ax += ap[i].x; ay += ap[i].y; }
-            nx /= nc; ny /= nc; ax /= ac; ay /= ac;
-            float ox = nx - ax, oy = ny - ay;
-            px = c.isVideoMirrored ? ox : -ox; py = oy; havePose = YES;
-        } else {
-            float yaw = f.yaw ? f.yaw.floatValue : 0, pitch = 0;
-            if (@available(iOS 15.0, *)) { if (f.pitch) pitch = f.pitch.floatValue; }
-            px = yaw; py = pitch;
-        }
-        BOOL cd = _center >= kNeedCenter;
-        float qx = cd ? px - _biasX : px, qy = cd ? py - _biasY : py;
-        float tol = havePose ? 0.04f : 0.10f;
-        int bin = -2;   // -2 = in between, ignore
-        if (!cd) {
-            // step 1: no fixed "centre" - whenever the face holds still, that IS straight ahead (offsets differ per face)
-            // (0.4.1) no stillness gate any more: any frame with a face counts as "straight ahead", unless it is clearly
-            // turned away from the straight-ahead frames already taken
-            if (_cN == 0 || hypotf(px - _cSumX / _cN, py - _cSumY / _cN) < 0.12f) bin = -1;
-        } else if (hypotf(qx, qy) >= tol) bin = ((int)lroundf(atan2f(qy, qx) / (float)(M_PI / 4)) % 8 + 8) % 8;
-        BOOL need = (bin == -1) ? (_center < kNeedCenter) : (bin >= 0 ? _secCount[bin] < kNeedPer : NO);
-        if (need && now - _lastCap >= 0.25) {
-            VNFeaturePrintObservation *fp = [self printFor:pb face:f.boundingBox];
-            if (fp) {
-                [_got addObject:fp]; [_bins addObject:@(bin)];
-                if (bin == -1) {
-                    _center++; _cSumX += px; _cSumY += py; _cN++;
-                    if (_center >= kNeedCenter) { _biasX = _cSumX / _cN; _biasY = _cSumY / _cN; PFLog(@"center done, bias %.3f %.3f", _biasX, _biasY); }
-                } else { _secCount[bin]++; _lastSec = bin; }
-                _lastGain = now; _lastCap = now;
-            }
-        }
-        cd = _center >= kNeedCenter;
-        int full = 0, total = MIN(_center, kNeedCenter);
-        NSMutableArray *cnt = [NSMutableArray new];
-        for (int k = 0; k < 8; k++) { if (_secCount[k] >= kNeedPer) full++; total += MIN(_secCount[k], kNeedPer); [cnt addObject:@(MIN(_secCount[k], kNeedPer))]; }
-        int target = -1;
-        if (cd) {   // next gap, going clockwise from where we last were
-            int start = _lastSec >= 0 ? _lastSec : 2;
-            for (int t = 0; t < 8; t++) { int k = ((start - t) % 8 + 8) % 8; if (_secCount[k] < kNeedPer) { target = k; break; } }
-        }
-        int pct = total * 100 / (kNeedCenter + 8 * kNeedPer);
-        NSString *msg, *sub;
-        if (!cd) { msg = @"Look straight at the camera\nand hold still"; sub = [NSString stringWithFormat:@"Step 1 of 2  ·  %d%%  ·  hold still", pct]; }
-        else if (full < 6) {
-            if (bin == target) msg = @"Good, hold it there…";
-            else msg = (now - _lastGain > 5) ? @"Tilt a little further toward\nthe bright green part of the ring" : @"Slowly move your head toward\nthe bright green part of the ring";
-            sub = [NSString stringWithFormat:@"Step 2 of 2  ·  %d%%  ·  keep your face in the circle", pct];
-        } else { msg = @"Almost done…"; sub = @"Finishing up"; }
-        [self report:@{@"hint": msg, @"sub": sub, @"face": @YES, @"sectors": cnt, @"target": @(target),
-                       @"centerDone": @(cd), @"center": @(MIN(_center, kNeedCenter)), @"dx": @(qx), @"dy": @(qy), @"dbg": [NSString stringWithFormat:@"%@  c%d  s%@  off %.2f,%.2f", havePose ? @"landmarks" : @"fallback", _center, [cnt componentsJoinedByString:@""], qx, qy]}];
-        if (cd && (full >= 6 || (now - _startTS > 45 && full >= 4))) [self finalizeEnroll];
-        return;
-    }
-
     VNFeaturePrintObservation *fp = [self printFor:pb face:f.boundingBox];
     if (!fp) return;
     float best = FLT_MAX;
@@ -423,26 +389,154 @@ static void PFInstallCrashRecorder(void) {
     [self report:@{@"best": @(best), @"limit": @(PFLimit(_db)), @"face": @YES}];
 }
 
+#pragma mark enroll engine
+
+- (NSArray *)sectorCounts { NSMutableArray *a = [NSMutableArray new]; for (int k = 0; k < 8; k++) [a addObject:@(MIN(_secCount[k], kNeedPer))]; return a; }
+
+- (void)addSample:(VNFeaturePrintObservation *)fp bin:(int)bin now:(NSTimeInterval)now {
+    [_got addObject:fp]; [_bins addObject:@(bin)]; [_scanOf addObject:@(_scanIdx)];
+    _lastCap = now; _lastGain = now;
+}
+
+- (void)enrollFrame:(CVPixelBufferRef)pb faces:(NSArray *)faces conn:(AVCaptureConnection *)c now:(NSTimeInterval)now {
+    NSDictionary *base = @{@"phase": @(_phase), @"scan": @(_scanIdx), @"sectors": [self sectorCounts],
+                           @"center": @(MIN(_center, kNeedCenter)), @"target": @(-1)};
+    NSString *code = nil; VNFaceObservation *f = nil;
+    if (faces.count == 0) code = @"nface";
+    else if (faces.count > 1) code = @"multi";
+    else {
+        f = faces[0];
+        CGRect b = f.boundingBox; float mx = CGRectGetMidX(b), my = CGRectGetMidY(b);
+        if (b.size.width < 0.3) code = @"close";
+        else if (b.size.width > 0.85) code = @"far";
+        else if (mx < 0.22 || mx > 0.78 || my < 0.18 || my > 0.82) code = @"center";
+    }
+    if (code) {
+        NSMutableDictionary *d = [base mutableCopy]; d[@"code"] = code; d[@"face"] = @NO;
+        [self report:d]; return;
+    }
+
+    // Head direction from where the nose sits inside the face (screen space: x right, y up). Works whatever
+    // the signs of Vision's yaw/pitch are, and matches what the user sees in the mirrored preview.
+    float px = 0, py = 0; BOOL havePose = NO;
+    VNFaceLandmarks2D *lm = f.landmarks;
+    if (lm && lm.nose && lm.allPoints && lm.nose.pointCount > 0 && lm.allPoints.pointCount > 0) {
+        const CGPoint *np = lm.nose.normalizedPoints, *ap = lm.allPoints.normalizedPoints;
+        size_t nc = lm.nose.pointCount, ac = lm.allPoints.pointCount;
+        float nx = 0, ny = 0, ax = 0, ay = 0;
+        for (size_t i = 0; i < nc; i++) { nx += np[i].x; ny += np[i].y; }
+        for (size_t i = 0; i < ac; i++) { ax += ap[i].x; ay += ap[i].y; }
+        nx /= nc; ny /= nc; ax /= ac; ay /= ac;
+        float ox = nx - ax, oy = ny - ay;
+        px = c.isVideoMirrored ? ox : -ox; py = oy; havePose = YES;
+    } else {
+        float yaw = f.yaw ? f.yaw.floatValue : 0, pitch = 0;
+        if (@available(iOS 15.0, *)) { if (f.pitch) pitch = f.pitch.floatValue; }
+        px = yaw; py = pitch;
+    }
+
+    if (_phase == 0) {
+        // Step 1: face found and centred. Whenever the face is roughly where the earlier straight-ahead frames were, it counts.
+        BOOL near = (_cN == 0 || hypotf(px - _cSumX / _cN, py - _cSumY / _cN) < 0.12f);
+        if (near && _center < kNeedCenter && now - _lastCap >= 0.25) {
+            VNFeaturePrintObservation *fp = [self printFor:pb face:f.boundingBox];
+            if (fp) { [self addSample:fp bin:-1 now:now]; _center++; _cSumX += px; _cSumY += py; _cN++; }
+        }
+        if (_center >= kNeedCenter) {
+            _biasX = _cSumX / _cN; _biasY = _cSumY / _cN;
+            _phase = 1; _scanStart = now; _lastGain = now;
+            PFLog(@"scan %d: straight-ahead done, bias %.3f %.3f", _scanIdx + 1, _biasX, _biasY);
+        }
+        NSMutableDictionary *d = [base mutableCopy];
+        d[@"phase"] = @(_phase); d[@"center"] = @(MIN(_center, kNeedCenter)); d[@"sectors"] = [self sectorCounts];
+        d[@"code"] = (_phase == 1) ? @"circle" : @"hold"; d[@"face"] = @YES;
+        [self report:d];
+        return;
+    }
+
+    // Step 2: head directions relative to the straight-ahead position.
+    float qx = px - _biasX, qy = py - _biasY, tol = havePose ? 0.04f : 0.10f;
+    int bin = -2;   // -2 = near centre / in between, ignore
+    if (hypotf(qx, qy) >= tol) bin = ((int)lroundf(atan2f(qy, qx) / (float)(M_PI / 4)) % 8 + 8) % 8;
+    if (bin >= 0 && _secCount[bin] < kNeedPer && now - _lastCap >= 0.25) {
+        VNFeaturePrintObservation *fp = [self printFor:pb face:f.boundingBox];
+        if (fp) { [self addSample:fp bin:bin now:now]; _secCount[bin]++; _lastSec = bin; }
+    }
+    int full = 0;
+    for (int k = 0; k < 8; k++) if (_secCount[k] >= kNeedPer) full++;
+    int target = -1;   // next gap, going clockwise from where we last were
+    int start = _lastSec >= 0 ? _lastSec : 2;
+    for (int t = 0; t < 8; t++) { int k = ((start - t) % 8 + 8) % 8; if (_secCount[k] < kNeedPer) { target = k; break; } }
+    NSString *msg = (bin >= 0 && bin == target) ? @"good" : (now - _lastGain > 5 ? @"further" : @"circle");
+    NSMutableDictionary *d = [base mutableCopy];
+    d[@"phase"] = @1; d[@"sectors"] = [self sectorCounts]; d[@"target"] = @(target); d[@"code"] = msg; d[@"face"] = @YES;
+    [self report:d];
+    if (now - _lastDbg > 1.0) {
+        _lastDbg = now;
+        PFLog(@"scan %d: %@ full=%d target=%d off %.2f,%.2f samples=%lu", _scanIdx + 1, havePose ? @"landmarks" : @"fallback", full, target, qx, qy, (unsigned long)_got.count);
+    }
+    if (full >= 6 || (now - _scanStart > 40 && full >= 4)) [self scanComplete:now];
+}
+
+- (void)scanComplete:(NSTimeInterval)now {
+    PFLog(@"scan %d complete (%lu samples so far)", _scanIdx + 1, (unsigned long)_got.count);
+    if (_scanIdx + 1 >= kScans) { _phase = 3; [self finalizeEnroll]; return; }
+    _phase = 2;
+    _deadlineTS = now + 30;   // time to tap Continue
+    [self report:@{@"event": @"scanDone", @"scan": @(_scanIdx)}];
+}
+
+// Tolerance base: how far a sample is from its nearest sample of the OTHER pass (an independent capture of the same
+// poses), 95th percentile. A live face later is exactly such an independent capture.
 - (void)finalizeEnroll {
-    NSInteger n = _got.count; float worst = 0;
+    NSInteger n = _got.count;
+    if (n < 10) { [self finish:NO info:@"not enough face samples were captured"]; return; }
+    NSMutableArray<NSNumber *> *ds = [NSMutableArray new];
     for (NSInteger i = 0; i < n; i++) {
         float mn = FLT_MAX;
         for (NSInteger j = 0; j < n; j++) {
-            if ([_bins[i] intValue] == [_bins[j] intValue]) continue;
+            if ([_scanOf[i] intValue] == [_scanOf[j] intValue]) continue;
             float d; if ([_got[i] computeDistance:&d toFeaturePrintObservation:_got[j] error:nil]) mn = MIN(mn, d);
         }
-        if (mn < FLT_MAX) worst = MAX(worst, mn);
+        if (mn < FLT_MAX) [ds addObject:@(mn)];
     }
-    float th = worst * 1.25f;
-    NSDictionary *db = @{@"prints": [_got copy], @"th": @(th), @"base": @(worst)};
-    NSData *dat = [NSKeyedArchiver archivedDataWithRootObject:db requiringSecureCoding:YES error:nil];
-    if (!dat || ![dat writeToFile:PFDBPath() atomically:YES]) { [self finish:NO info:@"could not save face data"]; return; }
+    float base = 0;
+    if (ds.count) {
+        [ds sortUsingSelector:@selector(compare:)];
+        base = [ds[(NSUInteger)floor((ds.count - 1) * 0.95)] floatValue];
+    }
+    if (base <= 0) {   // fallback: nearest sample of a different head direction
+        for (NSInteger i = 0; i < n; i++) {
+            float mn = FLT_MAX;
+            for (NSInteger j = 0; j < n; j++) {
+                if ([_bins[i] intValue] == [_bins[j] intValue]) continue;
+                float d; if ([_got[i] computeDistance:&d toFeaturePrintObservation:_got[j] error:nil]) mn = MIN(mn, d);
+            }
+            if (mn < FLT_MAX) base = MAX(base, mn);
+        }
+    }
+    if (base <= 0) { [self finish:NO info:@"couldn't measure the face data"]; return; }
+    NSDictionary *db = @{@"prints": [_got copy], @"th": @(base * 1.25f), @"base": @(base),
+                         @"bins": [_bins copy], @"scans": [_scanOf copy], @"version": @2,
+                         @"created": @((long long)[[NSDate date] timeIntervalSince1970])};
+    NSError *err = nil;
+    NSData *dat = [NSKeyedArchiver archivedDataWithRootObject:db requiringSecureCoding:YES error:&err];
+    if (!dat || ![dat writeToFile:PFDBPath() atomically:YES]) { PFLog(@"save failed: %@", err); [self finish:NO info:@"could not save face data"]; return; }
     chmod(PFDBPath().fileSystemRepresentation, 0600);
+    NSDictionary *back = PFLoadDB();   // prove the tweak will be able to read it
+    if ((NSInteger)[back[@"prints"] count] != n) {
+        PFLog(@"read-back mismatch: wrote %ld, read %lu", (long)n, (unsigned long)[back[@"prints"] count]);
+        [[NSFileManager defaultManager] removeItemAtPath:PFDBPath() error:nil];
+        [self finish:NO info:@"face data could not be read back after saving"]; return;
+    }
+    PFLog(@"saved %ld samples, base %.3f, %lu bytes", (long)n, base, (unsigned long)dat.length);
     [self finish:YES info:[NSString stringWithFormat:@"%ld samples", (long)n]];
 }
 @end
 
-#pragma mark - UI
+#pragma mark - UI (Face ID style setup)
+
+typedef NS_ENUM(int, PFStage) { PFStageIntro, PFStageScan, PFStageBetween, PFStageDone, PFStageFail };
 
 @interface PFVC : UIViewController
 - (void)startMode:(int)mode;
@@ -452,11 +546,12 @@ static void PFInstallCrashRecorder(void) {
 
 @implementation PFVC {
     PFScan *_scan; UIView *_circle; AVCaptureVideoPreviewLayer *_pl;
-    NSMutableArray<CAShapeLayer *> *_ticks; CAShapeLayer *_dot; int _tickSector[24], _pulseTarget;
-    UILabel *_title, *_hint, *_sub, *_ver; UIButton *_btn;
-    int _mode; BOOL _running, _finished;
+    NSMutableArray<CAShapeLayer *> *_ticks; int _tickSector[kTicks], _pulseTarget;
+    CAShapeLayer *_glyph, *_disc, *_check;
+    UILabel *_title, *_sub, *_ver; UIButton *_primary, *_secondary, *_cancel;
+    int _mode, _scanNo; PFStage _stage; BOOL _flow; NSTimer *_idle, *_attach;
 }
-- (BOOL)isRunning { return _running && !_finished; }
+- (BOOL)isRunning { return _flow; }
 - (BOOL)prefersStatusBarHidden { return YES; }
 
 - (UILabel *)label:(CGRect)f size:(CGFloat)s weight:(UIFontWeight)w color:(UIColor *)c {
@@ -465,71 +560,151 @@ static void PFInstallCrashRecorder(void) {
     l.textAlignment = NSTextAlignmentCenter; l.numberOfLines = 0;
     return l;
 }
+- (UIButton *)button:(CGRect)f title:(NSString *)t filled:(BOOL)filled action:(SEL)a {
+    UIButton *b = [UIButton buttonWithType:UIButtonTypeSystem];
+    b.frame = f;
+    b.titleLabel.font = [UIFont systemFontOfSize:19 weight:filled ? UIFontWeightSemibold : UIFontWeightRegular];
+    [b setTitle:t forState:UIControlStateNormal];
+    [b setTitleColor:filled ? UIColor.whiteColor : PFBlue() forState:UIControlStateNormal];
+    if (filled) { b.backgroundColor = PFBlue(); b.layer.cornerRadius = 14; }
+    [b addTarget:self action:a forControlEvents:UIControlEventTouchUpInside];
+    return b;
+}
+
+// The Face ID style face glyph: four corner brackets, two eyes, a nose and a smile.
+- (UIBezierPath *)glyphPath:(CGPoint)c size:(CGFloat)g {
+    UIBezierPath *p = [UIBezierPath bezierPath];
+    CGFloat s = g / 2, a = g * 0.28;
+    for (int sx = -1; sx <= 1; sx += 2) for (int sy = -1; sy <= 1; sy += 2) {
+        [p moveToPoint:CGPointMake(c.x + sx * s, c.y + sy * (s - a))];
+        [p addLineToPoint:CGPointMake(c.x + sx * s, c.y + sy * s)];
+        [p addLineToPoint:CGPointMake(c.x + sx * (s - a), c.y + sy * s)];
+    }
+    for (int e = -1; e <= 1; e += 2) {
+        [p moveToPoint:CGPointMake(c.x + e * g * 0.2, c.y - g * 0.17)];
+        [p addLineToPoint:CGPointMake(c.x + e * g * 0.2, c.y - g * 0.05)];
+    }
+    [p moveToPoint:CGPointMake(c.x, c.y - g * 0.12)];
+    [p addLineToPoint:CGPointMake(c.x, c.y + g * 0.07)];
+    [p addLineToPoint:CGPointMake(c.x - g * 0.06, c.y + g * 0.07)];
+    [p moveToPoint:CGPointMake(c.x - g * 0.2, c.y + g * 0.2)];
+    [p addQuadCurveToPoint:CGPointMake(c.x + g * 0.2, c.y + g * 0.2) controlPoint:CGPointMake(c.x, c.y + g * 0.34)];
+    return p;
+}
 
 - (void)viewDidLoad {
     [super viewDidLoad];
     UIView *v = self.view;
-    v.backgroundColor = [UIColor colorWithWhite:0.04 alpha:1];
+    v.backgroundColor = UIColor.blackColor;
     CGRect b = UIScreen.mainScreen.bounds;
     CGFloat W = b.size.width, H = b.size.height;
+    CGFloat d = MIN(W * 0.66, 270), cx = W / 2, cy = H * 0.37;
 
-    _title = [self label:CGRectMake(0, H * 0.07, W, 34) size:28 weight:UIFontWeightSemibold color:UIColor.whiteColor];
-    _title.text = @"PhotoFace";
-    [v addSubview:_title];
-
-    CGFloat d = MIN(W * 0.62, 260), cx = W / 2, cy = H * 0.34;
     _circle = [[UIView alloc] initWithFrame:CGRectMake(cx - d / 2, cy - d / 2, d, d)];
     _circle.backgroundColor = [UIColor colorWithWhite:0.11 alpha:1];
     _circle.layer.cornerRadius = d / 2; _circle.layer.masksToBounds = YES;
+    _circle.hidden = YES;
     [v addSubview:_circle];
 
     _ticks = [NSMutableArray new];
-    for (int i = 0; i < 24; i++) {
-        CGFloat a = -M_PI_2 + i * 2 * M_PI / 24, r1 = d / 2 + 8, r2 = d / 2 + 26;
+    for (int i = 0; i < kTicks; i++) {
+        CGFloat a = -M_PI_2 + i * 2 * M_PI / kTicks, r1 = d / 2 + 11, r2 = d / 2 + 25;
         UIBezierPath *p = [UIBezierPath bezierPath];
         [p moveToPoint:CGPointMake(cx + r1 * cos(a), cy + r1 * sin(a))];
         [p addLineToPoint:CGPointMake(cx + r2 * cos(a), cy + r2 * sin(a))];
         CAShapeLayer *l = [CAShapeLayer layer];
-        l.path = p.CGPath; l.lineWidth = 7; l.lineCap = kCALineCapRound;
-        l.strokeColor = PFDim().CGColor;
+        l.path = p.CGPath; l.lineWidth = 3.5; l.lineCap = kCALineCapRound;
+        l.strokeColor = PFTrack().CGColor; l.opacity = 0;
         [v.layer addSublayer:l]; [_ticks addObject:l];
-        float th = (90.f - 15.f * i) * (float)M_PI / 180.f;   // screen direction of this tick, counter-clockwise from "right"
+        float th = (90.f - (360.f / kTicks) * i) * (float)M_PI / 180.f;   // screen direction of this tick, counter-clockwise from "right"
         _tickSector[i] = ((int)lroundf(th / (float)(M_PI / 4)) % 8 + 8) % 8;
     }
     _pulseTarget = -2;
-    _dot = [CAShapeLayer layer];
-    _dot.path = [UIBezierPath bezierPathWithOvalInRect:CGRectMake(-9, -9, 18, 18)].CGPath;
-    _dot.fillColor = UIColor.whiteColor.CGColor;
-    _dot.shadowColor = UIColor.blackColor.CGColor; _dot.shadowOpacity = 0.6; _dot.shadowRadius = 3; _dot.shadowOffset = CGSizeZero;
-    _dot.zPosition = 10; _dot.hidden = YES;
-    [_circle.layer addSublayer:_dot];
 
-    CGFloat hy = cy + d / 2 + 48;
-    _hint = [self label:CGRectMake(24, hy, W - 48, 64) size:20 weight:UIFontWeightMedium color:UIColor.whiteColor];
-    _hint.text = @"Open Settings → PhotoFace\nto set up your face";
-    [v addSubview:_hint];
-    _sub = [self label:CGRectMake(28, hy + 70, W - 56, 60) size:14 weight:UIFontWeightRegular color:[UIColor colorWithWhite:0.6 alpha:1]];
-    _sub.text = @"";
+    _glyph = [CAShapeLayer layer];
+    _glyph.path = [self glyphPath:CGPointMake(cx, cy) size:d * 0.62].CGPath;
+    _glyph.fillColor = nil; _glyph.strokeColor = PFBlue().CGColor;
+    _glyph.lineWidth = 6; _glyph.lineCap = kCALineCapRound; _glyph.lineJoin = kCALineJoinRound;
+    [v.layer addSublayer:_glyph];
+
+    CGFloat R = d * 0.42;   // the green check shown when setup is complete
+    _disc = [CAShapeLayer layer];
+    _disc.frame = CGRectMake(cx - R, cy - R, 2 * R, 2 * R);
+    _disc.path = [UIBezierPath bezierPathWithOvalInRect:CGRectMake(0, 0, 2 * R, 2 * R)].CGPath;
+    _disc.fillColor = PFGreen().CGColor; _disc.hidden = YES;
+    [v.layer addSublayer:_disc];
+    _check = [CAShapeLayer layer];
+    _check.frame = _disc.frame;
+    UIBezierPath *cp = [UIBezierPath bezierPath];
+    [cp moveToPoint:CGPointMake(R * 0.55, R * 1.04)];
+    [cp addLineToPoint:CGPointMake(R * 0.88, R * 1.36)];
+    [cp addLineToPoint:CGPointMake(R * 1.46, R * 0.68)];
+    _check.path = cp.CGPath; _check.fillColor = nil; _check.strokeColor = UIColor.whiteColor.CGColor;
+    _check.lineWidth = 11; _check.lineCap = kCALineCapRound; _check.lineJoin = kCALineJoinRound; _check.hidden = YES;
+    [v.layer addSublayer:_check];
+
+    _title = [self label:CGRectMake(24, H * 0.62, W - 48, 70) size:27 weight:UIFontWeightBold color:UIColor.whiteColor];
+    [v addSubview:_title];
+    _sub = [self label:CGRectMake(32, H * 0.62 + 76, W - 64, 90) size:16 weight:UIFontWeightRegular color:[UIColor colorWithWhite:0.62 alpha:1]];
     [v addSubview:_sub];
 
-    _btn = [UIButton buttonWithType:UIButtonTypeSystem];
-    _btn.frame = CGRectMake(W / 2 - 90, H - 80, 180, 46);
-    _btn.titleLabel.font = [UIFont systemFontOfSize:18 weight:UIFontWeightMedium];
-    [_btn setTitle:@"Close" forState:UIControlStateNormal];
-    [_btn setTitleColor:UIColor.whiteColor forState:UIControlStateNormal];
-    [_btn addTarget:self action:@selector(tapMain) forControlEvents:UIControlEventTouchUpInside];
-    [v addSubview:_btn];
-    _ver = [self label:CGRectMake(0, H - 24, W, 16) size:10 weight:UIFontWeightRegular color:[UIColor colorWithWhite:0.4 alpha:1]];
-    _ver.text = @"PhotoFace Enroll build 0.4.1";
+    _primary = [self button:CGRectMake(W / 2 - 125, H - 108, 250, 52) title:@"Get Started" filled:YES action:@selector(tapPrimary)];
+    [v addSubview:_primary];
+    _secondary = [self button:CGRectMake(W / 2 - 125, H - 52, 250, 40) title:@"Close" filled:NO action:@selector(tapSecondary)];
+    _secondary.hidden = YES;
+    [v addSubview:_secondary];
+    _cancel = [self button:CGRectMake(14, 22, 90, 36) title:@"Cancel" filled:NO action:@selector(tapCancel)];
+    _cancel.titleLabel.font = [UIFont systemFontOfSize:17 weight:UIFontWeightRegular];
+    _cancel.contentHorizontalAlignment = UIControlContentHorizontalAlignmentLeft;
+    [v addSubview:_cancel];
+    _ver = [self label:CGRectMake(0, H - 16, W, 12) size:9 weight:UIFontWeightRegular color:[UIColor colorWithWhite:0.3 alpha:1]];
+    _ver.text = @"PhotoFace Enroll build 0.5.0";
     [v addSubview:_ver];
+    _primary.hidden = YES; _cancel.hidden = YES;
 }
 
-- (void)lightTicks:(int)n color:(UIColor *)c {
-    for (int i = 0; i < (int)_ticks.count; i++)
-        _ticks[i].strokeColor = (i < n ? c : PFDim()).CGColor;
+#pragma mark ring
+
+- (void)setTickColor:(UIColor *)c all:(BOOL)all { for (CAShapeLayer *l in _ticks) { l.strokeColor = c.CGColor; if (all) l.opacity = 1; } }
+- (void)showRing:(BOOL)on {
+    for (CAShapeLayer *l in _ticks) { l.opacity = on ? 1 : 0; [l removeAnimationForKey:@"pulse"]; l.strokeColor = PFTrack().CGColor; }
+    _pulseTarget = -2;
 }
+- (void)applyRing:(NSArray *)cnt target:(int)tgt phase:(int)ph {
+    int per[8] = {0}, idx[kTicks];
+    for (int i = 0; i < kTicks; i++) idx[i] = per[_tickSector[i]]++;
+    if (tgt != _pulseTarget) { for (CAShapeLayer *l in _ticks) [l removeAnimationForKey:@"pulse"]; _pulseTarget = tgt; }
+    for (int i = 0; i < kTicks; i++) {
+        CAShapeLayer *l = _ticks[i];
+        if (ph == 0) { l.strokeColor = PFTrack().CGColor; [l removeAnimationForKey:@"pulse"]; continue; }
+        int sct = _tickSector[i], c = MIN([cnt[sct] intValue], kNeedPer);
+        int filled = (int)ceilf(per[sct] * c / (float)kNeedPer);
+        if (idx[i] < filled) { l.strokeColor = PFGreen().CGColor; [l removeAnimationForKey:@"pulse"]; }
+        else if (sct == tgt) {
+            l.strokeColor = [UIColor colorWithRed:0.55 green:1 blue:0.68 alpha:1].CGColor;   // the part of the ring to head toward, pulsing
+            if (![l animationForKey:@"pulse"]) {
+                CABasicAnimation *a = [CABasicAnimation animationWithKeyPath:@"opacity"];
+                a.fromValue = @1; a.toValue = @0.25; a.duration = 0.55; a.autoreverses = YES; a.repeatCount = HUGE_VALF;
+                [l addAnimation:a forKey:@"pulse"];
+            }
+        } else { l.strokeColor = PFTrack().CGColor; [l removeAnimationForKey:@"pulse"]; }
+    }
+    _circle.layer.borderWidth = 3;
+    _circle.layer.borderColor = (ph == 0 ? PFTrack() : PFGreen()).CGColor;
+}
+- (void)fillRingSweep {   // the circle completes itself clockwise
+    for (CAShapeLayer *l in _ticks) [l removeAnimationForKey:@"pulse"];
+    for (int i = 0; i < kTicks; i++) {
+        CAShapeLayer *l = _ticks[i];
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(i * 9 * NSEC_PER_MSEC)), dispatch_get_main_queue(), ^{ l.opacity = 1; l.strokeColor = PFGreen().CGColor; });
+    }
+}
+- (void)haptic { [[UINotificationFeedbackGenerator new] notificationOccurred:UINotificationFeedbackTypeSuccess]; }
+
+#pragma mark preview
 
 - (void)attachPreview {
+    if (!kShowLivePreview) return;
     AVCaptureSession *s = _scan.session;
     if (!s) return;
     if (_pl) { if (_pl.session != s) _pl.session = s; return; }
@@ -539,97 +714,165 @@ static void PFInstallCrashRecorder(void) {
     if (_pl.connection.isVideoOrientationSupported) _pl.connection.videoOrientation = AVCaptureVideoOrientationPortrait;
     [_circle.layer addSublayer:_pl];
 }
+- (void)detachPreview { [_attach invalidate]; _attach = nil; [_pl removeFromSuperlayer]; _pl = nil; }
+
+#pragma mark screens
+
+- (void)setTitle_:(NSString *)t sub:(NSString *)s { if (![_title.text isEqualToString:t]) _title.text = t; if (![_sub.text isEqualToString:s]) _sub.text = s; }
+- (void)idleStart {
+    [_idle invalidate];
+    __weak PFVC *ws = self;
+    _idle = [NSTimer scheduledTimerWithTimeInterval:40 repeats:NO block:^(NSTimer *t) { PFVC *s = ws; if (s && s->_stage == PFStageIntro) { PFLog(@"intro idle, cancelling"); [s finished:NO info:@"cancelled"]; } }];
+}
 
 - (void)startMode:(int)mode {
     PFLog(@"startMode %d begin", mode);
     if ([self isRunning]) return;
-    _mode = mode; _running = YES; _finished = NO;
-    [_pl removeFromSuperlayer]; _pl = nil;
-    _hint.textColor = UIColor.whiteColor;
-    _title.text = (mode == 2) ? @"Face Setup" : @"Test Recognition";
-    _hint.text = (mode == 2) ? @"Position your face in the circle\nand look straight ahead" : @"Look at the camera";
-    _sub.font = [UIFont systemFontOfSize:14 weight:UIFontWeightRegular];
-    _sub.textAlignment = NSTextAlignmentCenter;
-    _sub.frame = CGRectMake(28, _hint.frame.origin.y + 70, self.view.bounds.size.width - 56, 60);
-    _sub.text = (mode == 2) ? @"Use good, even lighting and keep only your face in view. Hold the phone at eye level."
-                            : @"Shows how close the live match is to your enrolled face. Lower is closer.";
-    [_btn setTitle:@"Cancel" forState:UIControlStateNormal];
-    [_btn setTitleColor:UIColor.whiteColor forState:UIControlStateNormal];
-    [self lightTicks:0 color:PFGreen()];
-    _pulseTarget = -2; _dot.hidden = YES; _circle.layer.borderWidth = 0;
+    _mode = mode; _flow = YES; _scanNo = 0;
+    _title.textColor = UIColor.whiteColor;
+    if (mode == 2) [self showIntro]; else [self beginTest];
+}
 
+- (void)showIntro {
+    _stage = PFStageIntro;
+    [self detachPreview];
+    _circle.hidden = YES; [self showRing:NO];
+    _disc.hidden = YES; _check.hidden = YES; _glyph.hidden = NO; _glyph.strokeColor = PFBlue().CGColor;
+    [self setTitle_:@"PhotoFace" sub:@"PhotoFace uses the front camera to recognise your face and unlock your iPhone.\n\nHold your iPhone upright, at arm's length, in good light."];
+    [_primary setTitle:@"Get Started" forState:UIControlStateNormal]; _primary.hidden = NO;
+    _secondary.hidden = YES; _cancel.hidden = NO;
+    [self idleStart];
+}
+
+- (void)beginScan:(int)idx {
+    [_idle invalidate]; _idle = nil;
+    _scanNo = idx; _stage = PFStageScan;
+    _glyph.hidden = (BOOL)kShowLivePreview; _glyph.strokeColor = [UIColor colorWithWhite:1 alpha:0.28].CGColor;
+    _disc.hidden = YES; _check.hidden = YES;
+    _circle.hidden = NO; _circle.layer.borderWidth = 3; _circle.layer.borderColor = PFTrack().CGColor;
+    [self showRing:YES];
+    _primary.hidden = YES; _secondary.hidden = YES; _cancel.hidden = NO;
+    [self setTitle_:@"Position your face in the frame" sub:@"Look straight at the camera."];
+    if (idx == 0) {
+        _scan = [PFScan new];
+        __weak PFVC *ws = self;
+        _scan.progress = ^(NSDictionary *i) { [ws update:i]; };
+        [_scan start:2 timeout:kScanSeconds done:^(BOOL ok, NSString *info) { [ws finished:ok info:info]; }];
+        PFLog(@"scan 1 started, attaching preview");
+        [self attachPreview];
+        // the session can be rebuilt on a retry; keep the preview attached
+        [_attach invalidate];
+        _attach = [NSTimer scheduledTimerWithTimeInterval:0.5 repeats:YES block:^(NSTimer *t) {
+            PFVC *s = ws; if (!s || !s->_flow) { [t invalidate]; return; }
+            [s attachPreview];
+        }];
+    } else {
+        [_scan nextScan];
+    }
+}
+
+- (void)beginTest {
+    _stage = PFStageScan;
+    _glyph.hidden = YES; _disc.hidden = YES; _check.hidden = YES;
+    _circle.hidden = NO; [self showRing:YES];
+    _primary.hidden = YES; _secondary.hidden = YES; _cancel.hidden = NO;
+    [self setTitle_:@"Test Recognition" sub:@"Look at the camera. Shows how close the live match is to your enrolled face. Lower is closer."];
     _scan = [PFScan new];
     __weak PFVC *ws = self;
     _scan.progress = ^(NSDictionary *i) { [ws update:i]; };
-    [_scan start:mode timeout:(mode == 2 ? 120 : 90) done:^(BOOL ok, NSString *info) { [ws finished:ok info:info]; }];
-    PFLog(@"startMode: scan started, attaching preview");
+    [_scan start:3 timeout:90 done:^(BOOL ok, NSString *info) { [ws finished:ok info:info]; }];
     [self attachPreview];
-    // the session can be rebuilt on a retry; keep the preview attached
-    [NSTimer scheduledTimerWithTimeInterval:0.5 repeats:YES block:^(NSTimer *t) {
-        PFVC *s = ws; if (!s || !s->_running || s->_finished) { [t invalidate]; return; }
+    [_attach invalidate];
+    _attach = [NSTimer scheduledTimerWithTimeInterval:0.5 repeats:YES block:^(NSTimer *t) {
+        PFVC *s = ws; if (!s || !s->_flow) { [t invalidate]; return; }
         [s attachPreview];
     }];
 }
 
-- (void)applyRing:(NSArray *)cnt target:(int)tgt centerDone:(BOOL)cd center:(int)center {
-    int per[8] = {0}, idx[24];
-    for (int i = 0; i < 24; i++) idx[i] = per[_tickSector[i]]++;
-    if (tgt != _pulseTarget) { for (CAShapeLayer *l in _ticks) [l removeAllAnimations]; _pulseTarget = tgt; }
-    for (int i = 0; i < 24; i++) {
-        CAShapeLayer *l = _ticks[i];
-        if (!cd) {
-            // step 1: the whole ring fills green, clockwise from the top, while you hold still
-            int lit = (int)ceilf(24.f * center / (float)kNeedCenter);
-            l.strokeColor = (i < lit ? PFGreen() : PFDim()).CGColor;
-            [l removeAnimationForKey:@"pulse"];
-            continue;
-        }
-        int sct = _tickSector[i], c = MIN([cnt[sct] intValue], kNeedPer);
-        int filled = (int)ceilf(per[sct] * c / (float)kNeedPer);
-        if (idx[i] < filled) { l.strokeColor = PFGreen().CGColor; [l removeAnimationForKey:@"pulse"]; }
-        else if (sct == tgt) {
-            // the part of the ring to head toward: bright green, pulsing
-            l.strokeColor = [UIColor colorWithRed:0.45 green:1 blue:0.6 alpha:1].CGColor;
-            if (![l animationForKey:@"pulse"]) {
-                CABasicAnimation *a = [CABasicAnimation animationWithKeyPath:@"opacity"];
-                a.fromValue = @1; a.toValue = @0.2; a.duration = 0.5; a.autoreverses = YES; a.repeatCount = HUGE_VALF;
-                [l addAnimation:a forKey:@"pulse"];
-            }
-        } else { l.strokeColor = PFDim().CGColor; [l removeAnimationForKey:@"pulse"]; }
-    }
-    _circle.layer.borderWidth = 3;
-    _circle.layer.borderColor = (cd ? PFGreen() : PFDim()).CGColor;
+- (void)showBetween {
+    _stage = PFStageBetween;
+    [self fillRingSweep]; [self haptic];
+    _circle.layer.borderColor = PFGreen().CGColor;
+    [self setTitle_:@"First scan complete" sub:@"Now move your head slowly to complete the circle a second time."];
+    [_primary setTitle:@"Continue" forState:UIControlStateNormal]; _primary.hidden = NO;
 }
 
+- (void)showDone:(NSString *)info {
+    _stage = PFStageDone; [self detachPreview];
+    [self haptic];
+    _circle.hidden = YES; [self showRing:NO]; _glyph.hidden = YES;
+    _disc.hidden = NO; _check.hidden = NO;
+    CABasicAnimation *pop = [CABasicAnimation animationWithKeyPath:@"transform.scale"];
+    pop.fromValue = @0.4; pop.toValue = @1; pop.duration = 0.35; pop.timingFunction = [CAMediaTimingFunction functionWithName:kCAMediaTimingFunctionEaseOut];
+    [_disc addAnimation:pop forKey:@"pop"]; [_check addAnimation:pop forKey:@"pop"];
+    [self setTitle_:@"PhotoFace is now set up" sub:@"You can unlock your iPhone by looking at it. After a restart you still enter your passcode once."];
+    [_primary setTitle:@"Done" forState:UIControlStateNormal]; _primary.hidden = NO;
+    _secondary.hidden = YES; _cancel.hidden = YES;
+}
+
+- (void)showFail:(NSString *)info {
+    _stage = PFStageFail; [self detachPreview];
+    _circle.hidden = YES; [self showRing:NO]; _disc.hidden = YES; _check.hidden = YES;
+    _glyph.hidden = NO; _glyph.strokeColor = [UIColor colorWithRed:1 green:0.35 blue:0.3 alpha:1].CGColor;
+    [self setTitle_:(_mode == 3 ? @"Test couldn't run" : @"Setup didn't finish") sub:[NSString stringWithFormat:@"%@", info]];
+    [_primary setTitle:@"Try Again" forState:UIControlStateNormal]; _primary.hidden = NO;
+    [_secondary setTitle:@"Close" forState:UIControlStateNormal]; _secondary.hidden = NO; _cancel.hidden = YES;
+}
+
+#pragma mark actions
+
+- (void)tapPrimary {
+    switch (_stage) {
+        case PFStageIntro:   [self beginScan:0]; break;
+        case PFStageBetween: [self beginScan:1]; break;
+        case PFStageDone:    [self leave]; break;
+        case PFStageFail:    _flow = YES; if (_mode == 3) [self beginTest]; else [self beginScan:0]; break;
+        default: break;
+    }
+}
+- (void)tapSecondary { [self leave]; }
+- (void)tapCancel { [self abortIfRunning]; }
+- (void)abortIfRunning {
+    if (!_flow) return;
+    if (_scan.mode) [_scan cancel]; else [self finished:NO info:@"cancelled"];
+}
+
+#pragma mark progress
+
 - (void)update:(NSDictionary *)i {
-    if (_finished) return;
+    if (!_flow) return;
     [self attachPreview];
-    if (_mode == 2) {
-        if (i[@"sectors"]) [self applyRing:i[@"sectors"] target:[i[@"target"] intValue] centerDone:[i[@"centerDone"] boolValue] center:[i[@"center"] intValue]];
-        if (i[@"hint"]) _hint.text = i[@"hint"];
-        if (i[@"sub"]) _sub.text = i[@"sub"];
-        if (i[@"dbg"]) _ver.text = [NSString stringWithFormat:@"build 0.4.1  ·  %@", i[@"dbg"]];
-        if ([i[@"face"] boolValue] && i[@"dx"]) {   // live "where is my head pointing" dot
-            CGFloat R = _circle.bounds.size.width / 2, k = R / 0.22;
-            CGFloat x = [i[@"dx"] floatValue] * k, y = -[i[@"dy"] floatValue] * k, m = hypot(x, y), lim = R * 0.82;
-            if (m > lim) { x *= lim / m; y *= lim / m; }
-            [CATransaction begin]; [CATransaction setDisableActions:YES];
-            _dot.position = CGPointMake(R + x, R + y); _dot.hidden = NO;
-            [CATransaction commit];
-        } else _dot.hidden = YES;
-    } else {
+    if (_mode == 3) {
         if (i[@"best"]) {
             float best = [i[@"best"] floatValue], lim = [i[@"limit"] floatValue];
             BOOL ok = best < lim;
-            [self lightTicks:ok ? 24 : 0 color:PFGreen()];
-            _hint.text = [NSString stringWithFormat:@"Match %.2f   (needs below %.2f)\n%@", best, lim, ok ? @"✓ Recognised" : @"✗ Not recognised"];
-        } else if (i[@"hint"]) { _hint.text = i[@"hint"]; [self lightTicks:0 color:PFGreen()]; }
+            [self setTickColor:ok ? PFGreen() : PFTrack() all:YES];
+            [self setTitle_:[NSString stringWithFormat:@"Match %.2f  (needs below %.2f)", best, lim] sub:ok ? @"✓ Recognised" : @"✗ Not recognised"];
+        } else if (i[@"hint"]) { [self setTickColor:PFTrack() all:YES]; [self setTitle_:i[@"hint"] sub:@""]; }
+        return;
     }
+    if ([i[@"event"] isEqual:@"scanDone"]) { if (_stage == PFStageScan) [self showBetween]; return; }
+    if (_stage != PFStageScan) return;
+    int ph = [i[@"phase"] intValue];
+    if (i[@"sectors"]) [self applyRing:i[@"sectors"] target:[i[@"target"] intValue] phase:ph];
+    NSString *code = i[@"code"] ?: @"";
+    NSString *t = @"Position your face in the frame", *s = @"Look straight at the camera.";
+    if ([code isEqual:@"nface"]) { s = @"Can't see your face. Look at the front camera."; }
+    else if ([code isEqual:@"multi"]) { t = @"Only one face, please"; s = @"Make sure nobody else is in view."; }
+    else if ([code isEqual:@"close"]) { t = @"Move a little closer"; s = @"Bring your face closer to the camera."; }
+    else if ([code isEqual:@"far"]) { t = @"Move back a little"; s = @"Your face is too close to the camera."; }
+    else if ([code isEqual:@"center"]) { t = @"Center your face in the frame"; s = @"Keep your whole face inside the circle."; }
+    else if ([code isEqual:@"hold"]) { s = @"Hold still…"; }
+    else if ([code isEqual:@"circle"]) { t = @"Move your head slowly to complete the circle"; s = _scanNo == 0 ? @"" : @"Second scan"; }
+    else if ([code isEqual:@"good"]) { t = @"Move your head slowly to complete the circle"; s = @"Good, keep going."; }
+    else if ([code isEqual:@"further"]) { t = @"Move your head slowly to complete the circle"; s = @"Tilt a little further toward the bright part of the ring."; }
+    else if (!code.length && ph == 1) { t = @"Move your head slowly to complete the circle"; s = @""; }
+    [self setTitle_:t sub:s];
 }
 
 - (void)finished:(BOOL)ok info:(NSString *)info {
-    _finished = YES; _dot.hidden = YES;
-    for (CAShapeLayer *l in _ticks) [l removeAllAnimations];
+    if (!_flow) return;
+    _flow = NO; [_idle invalidate]; _idle = nil; [_attach invalidate]; _attach = nil;
     BOOL cancelled = [info isEqualToString:@"cancelled"];
     if (_mode == 2) {
         if (ok) PFWriteStatus([@"ok: " stringByAppendingString:info]);
@@ -638,31 +881,15 @@ static void PFInstallCrashRecorder(void) {
     }
     notify_post("com.photoface.enrolldone");
     if (cancelled) { [self leave]; return; }
-    if (ok && _mode == 2) {
-        [self lightTicks:24 color:PFGreen()];
-        _hint.text = @"Setup complete";
-        _hint.textColor = PFGreen();
-        _sub.text = @"Lock your phone, then wake it while looking at the screen. After a restart you still enter your passcode once.";
-        [_btn setTitle:@"Done" forState:UIControlStateNormal];
-        [_btn setTitleColor:PFGreen() forState:UIControlStateNormal];
-    } else if (ok) {
-        [self leave];
-    } else {
-        [self lightTicks:0 color:PFGreen()];
-        _hint.text = (_mode == 2) ? @"Setup didn't finish" : @"Test couldn't run";
-        _hint.textColor = [UIColor colorWithRed:1 green:0.35 blue:0.3 alpha:1];
-        _sub.text = [NSString stringWithFormat:@"Reason: %@", info];
-        [_btn setTitle:@"Close" forState:UIControlStateNormal];
-    }
+    if (ok && _mode == 2) [self showDone:info];
+    else if (ok) [self leave];
+    else [self showFail:info];
 }
-
-- (void)abortIfRunning { if ([self isRunning]) [_scan cancel]; }
-- (void)tapMain { if ([self isRunning]) [_scan cancel]; else [self leave]; }
 
 // go back to the Home Screen and drop the process so the camera is released
 - (void)leave {
     PFLog(@"leave: going home and exiting");
-    _running = NO;
+    _flow = NO;
     UIApplication *app = [UIApplication sharedApplication];
     SEL sus = NSSelectorFromString(@"suspend");
     if ([app respondsToSelector:sus]) ((void (*)(id, SEL))objc_msgSend)(app, sus);
