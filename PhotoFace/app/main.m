@@ -265,6 +265,9 @@ static void PFInstallCrashRecorder(void) {
     });
 }
 
+static int PFKV(id o, NSString *k) {   // KVC: these properties are missing/unavailable in the iOS 15 SDK headers
+    @try { id v = [o valueForKey:k]; return v ? [v intValue] : -1; } @catch (NSException *e) { return -1; }
+}
 - (void)logState:(NSString *)why {
     AVCaptureSession *s = _s;
     AVCaptureDevice *d = [(AVCaptureDeviceInput *)s.inputs.firstObject device];
@@ -273,7 +276,7 @@ static void PFInstallCrashRecorder(void) {
     AVCaptureConnection *c = [o connectionWithMediaType:AVMediaTypeVideo];
     PFLog(@"state(%@): variant=%d session running=%d interrupted=%d inputs=%lu outputs=%lu | device connected=%d suspended=%d inUseByOtherApp=%d fmt=%@ | conn enabled=%d active=%d | delegate=%@ queue=%@ | frames=%d",
           why, _variant, s.isRunning, s.isInterrupted, (unsigned long)s.inputs.count, (unsigned long)s.outputs.count,
-          d.isConnected, d.isSuspended, d.isInUseByAnotherApplication, d.activeFormat, c.isEnabled, c.isActive,
+          d.isConnected, PFKV(d, @"suspended"), PFKV(d, @"inUseByAnotherApplication"), d.activeFormat, c.isEnabled, c.isActive,
           o.sampleBufferDelegate ? @"set" : @"NIL", o.sampleBufferCallbackQueue ? @"set" : @"NIL", _frames);
 }
 
