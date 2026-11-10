@@ -324,14 +324,14 @@ static void PFInstallCrashRecorder(void) {
     if (!pb) return;
 
     VNImageRequestHandler *h = [[VNImageRequestHandler alloc] initWithCVPixelBuffer:pb options:@{}];
-    VNRequest *fr = nil; BOOL usedLM = NO; NSError *verr = nil;
+    VNRequest *fr = nil; NSError *verr = nil;
     if (mode == 2 && !_lmBroken) {
         VNDetectFaceLandmarksRequest *lr = [VNDetectFaceLandmarksRequest new];
 #pragma clang diagnostic push
 #pragma clang diagnostic ignored "-Wdeprecated-declarations"
         lr.usesCPUOnly = YES;   // GPU/ANE paths are not available to this unsandboxed app (same cause as the Core Image crash)
 #pragma clang diagnostic pop
-        if ([h performRequests:@[lr] error:&verr]) { fr = lr; usedLM = YES; }
+        if ([h performRequests:@[lr] error:&verr]) { fr = lr; }
         else { _lmBroken = YES; PFLog(@"landmarks request failed (%@) - falling back to plain face detection", verr); }
     }
     if (!fr) {
@@ -516,7 +516,7 @@ static void PFInstallCrashRecorder(void) {
     [_btn addTarget:self action:@selector(tapMain) forControlEvents:UIControlEventTouchUpInside];
     [v addSubview:_btn];
     _ver = [self label:CGRectMake(0, H - 24, W, 16) size:10 weight:UIFontWeightRegular color:[UIColor colorWithWhite:0.4 alpha:1]];
-    _ver.text = @"PhotoFace Enroll build 0.3.7";
+    _ver.text = @"PhotoFace Enroll build 0.3.8";
     [v addSubview:_ver];
 }
 
@@ -596,7 +596,7 @@ static void PFInstallCrashRecorder(void) {
         if (i[@"sectors"]) [self applyRing:i[@"sectors"] target:[i[@"target"] intValue] centerDone:[i[@"centerDone"] boolValue]];
         if (i[@"hint"]) _hint.text = i[@"hint"];
         if (i[@"sub"]) _sub.text = i[@"sub"];
-        if (i[@"pose"]) _ver.text = [NSString stringWithFormat:@"PhotoFace Enroll build 0.3.7  ·  pose: %@", i[@"pose"]];
+        if (i[@"pose"]) _ver.text = [NSString stringWithFormat:@"PhotoFace Enroll build 0.3.8  ·  pose: %@", i[@"pose"]];
         if ([i[@"face"] boolValue] && i[@"dx"]) {   // live "where is my head pointing" dot
             CGFloat R = _circle.bounds.size.width / 2, k = R / 0.22;
             CGFloat x = [i[@"dx"] floatValue] * k, y = -[i[@"dy"] floatValue] * k, m = hypot(x, y), lim = R * 0.82;
