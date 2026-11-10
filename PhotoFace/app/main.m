@@ -18,7 +18,8 @@
 
 static NSString *const kDir = @"/var/mobile/Library/PhotoFace";
 static CFStringRef const kPrefDom = CFSTR("com.photoface.tweak");
-#define kNeedCenter 6   // straight-ahead samples per scan
+#define kNeedCenter 4   // straight-ahead samples per scan (old, working enroll method)
+#define kUseLandmarks 0 // 0 = old method: plain face detection, direction from Vision yaw/pitch
 #define kNeedPer 2      // samples per head direction (8 directions) per scan
 #define kScans 2        // Face ID style: two passes around the circle
 #define kScanSeconds 55 // time limit for one pass (the whole flow must stay under the tweak's 200 s watchdog)
@@ -353,7 +354,7 @@ static void PFInstallCrashRecorder(void) {
 
     VNImageRequestHandler *h = [[VNImageRequestHandler alloc] initWithCVPixelBuffer:pb options:@{}];
     VNRequest *fr = nil; NSError *verr = nil;
-    if (mode == 2 && !_lmBroken) {
+    if (mode == 2 && !_lmBroken && kUseLandmarks) {
         VNDetectFaceLandmarksRequest *lr = [VNDetectFaceLandmarksRequest new];
 #pragma clang diagnostic push
 #pragma clang diagnostic ignored "-Wdeprecated-declarations"
@@ -399,83 +400,56 @@ static void PFInstallCrashRecorder(void) {
 }
 
 - (void)enrollFrame:(CVPixelBufferRef)pb faces:(NSArray *)faces conn:(AVCaptureConnection *)c now:(NSTimeInterval)now {
+    // Old enroll method (worked reliably): plain face detection, head direction straight from Vision yaw/pitch,
+    // kNeedCenter frontal samples + kNeedPer samples in each of 8 directions. No landmarks, no pose bias, no stillness gate.
     NSDictionary *base = @{@"phase": @(_phase), @"scan": @(_scanIdx), @"sectors": [self sectorCounts],
                            @"center": @(MIN(_center, kNeedCenter)), @"target": @(-1)};
     NSString *code = nil; VNFaceObservation *f = nil;
     if (faces.count == 0) code = @"nface";
     else if (faces.count > 1) code = @"multi";
-    else {
-        f = faces[0];
-        CGRect b = f.boundingBox; float mx = CGRectGetMidX(b), my = CGRectGetMidY(b);
-        if (b.size.width < 0.3) code = @"close";
-        else if (b.size.width > 0.85) code = @"far";
-        else if (mx < 0.22 || mx > 0.78 || my < 0.18 || my > 0.82) code = @"center";
-    }
+    else { f = faces[0]; if (f.boundingBox.size.width < 0.3) code = @"close"; }
     if (code) {
         NSMutableDictionary *d = [base mutableCopy]; d[@"code"] = code; d[@"face"] = @NO;
         [self report:d]; return;
     }
 
-    // Head direction from where the nose sits inside the face (screen space: x right, y up). Works whatever
-    // the signs of Vision's yaw/pitch are, and matches what the user sees in the mirrored preview.
-    float px = 0, py = 0; BOOL havePose = NO;
-    VNFaceLandmarks2D *lm = f.landmarks;
-    if (lm && lm.nose && lm.allPoints && lm.nose.pointCount > 0 && lm.allPoints.pointCount > 0) {
-        const CGPoint *np = lm.nose.normalizedPoints, *ap = lm.allPoints.normalizedPoints;
-        size_t nc = lm.nose.pointCount, ac = lm.allPoints.pointCount;
-        float nx = 0, ny = 0, ax = 0, ay = 0;
-        for (size_t i = 0; i < nc; i++) { nx += np[i].x; ny += np[i].y; }
-        for (size_t i = 0; i < ac; i++) { ax += ap[i].x; ay += ap[i].y; }
-        nx /= nc; ny /= nc; ax /= ac; ay /= ac;
-        float ox = nx - ax, oy = ny - ay;
-        px = c.isVideoMirrored ? ox : -ox; py = oy; havePose = YES;
-    } else {
-        float yaw = f.yaw ? f.yaw.floatValue : 0, pitch = 0;
-        if (@available(iOS 15.0, *)) { if (f.pitch) pitch = f.pitch.floatValue; }
-        px = yaw; py = pitch;
+    float yaw = NAN, pitch = NAN;
+    if (f.yaw) yaw = f.yaw.floatValue;
+    if (@available(iOS 15.0, *)) { if (f.pitch) pitch = f.pitch.floatValue; }
+    int bin;
+    if (isnan(yaw) || isnan(pitch)) bin = (_center < kNeedCenter) ? -1 : (int)(_got.count % 8);
+    else {
+        float mag = hypotf(yaw, pitch);
+        if (mag < 0.15f) bin = -1;
+        else bin = ((int)lroundf(atan2f(pitch, yaw) / (float)(M_PI / 4)) + 8) % 8;
     }
-
-    if (_phase == 0) {
-        // Step 1: face found and centred. Whenever the face is roughly where the earlier straight-ahead frames were, it counts.
-        BOOL near = (_cN == 0 || hypotf(px - _cSumX / _cN, py - _cSumY / _cN) < 0.12f);
-        if (near && _center < kNeedCenter && now - _lastCap >= 0.25) {
-            VNFeaturePrintObservation *fp = [self printFor:pb face:f.boundingBox];
-            if (fp) { [self addSample:fp bin:-1 now:now]; _center++; _cSumX += px; _cSumY += py; _cN++; }
-        }
-        if (_center >= kNeedCenter) {
-            _biasX = _cSumX / _cN; _biasY = _cSumY / _cN;
-            _phase = 1; _scanStart = now; _lastGain = now;
-            PFLog(@"scan %d: straight-ahead done, bias %.3f %.3f", _scanIdx + 1, _biasX, _biasY);
-        }
-        NSMutableDictionary *d = [base mutableCopy];
-        d[@"phase"] = @(_phase); d[@"center"] = @(MIN(_center, kNeedCenter)); d[@"sectors"] = [self sectorCounts];
-        d[@"code"] = (_phase == 1) ? @"circle" : @"hold"; d[@"face"] = @YES;
-        [self report:d];
-        return;
-    }
-
-    // Step 2: head directions relative to the straight-ahead position.
-    float qx = px - _biasX, qy = py - _biasY, tol = havePose ? 0.04f : 0.10f;
-    int bin = -2;   // -2 = near centre / in between, ignore
-    if (hypotf(qx, qy) >= tol) bin = ((int)lroundf(atan2f(qy, qx) / (float)(M_PI / 4)) % 8 + 8) % 8;
-    if (bin >= 0 && _secCount[bin] < kNeedPer && now - _lastCap >= 0.25) {
+    BOOL need = (bin == -1) ? (_center < kNeedCenter) : (_secCount[bin] < kNeedPer);
+    if (need) {
         VNFeaturePrintObservation *fp = [self printFor:pb face:f.boundingBox];
-        if (fp) { [self addSample:fp bin:bin now:now]; _secCount[bin]++; _lastSec = bin; }
+        if (fp) {
+            [self addSample:fp bin:bin now:now];
+            if (bin == -1) _center++; else { _secCount[bin]++; _lastSec = bin; }
+        }
+    }
+    if (_phase == 0 && _center >= kNeedCenter) {
+        _phase = 1; _scanStart = now; _lastGain = now;
+        PFLog(@"scan %d: straight-ahead done (%d samples)", _scanIdx + 1, _center);
     }
     int full = 0;
     for (int k = 0; k < 8; k++) if (_secCount[k] >= kNeedPer) full++;
     int target = -1;   // next gap, going clockwise from where we last were
     int start = _lastSec >= 0 ? _lastSec : 2;
     for (int t = 0; t < 8; t++) { int k = ((start - t) % 8 + 8) % 8; if (_secCount[k] < kNeedPer) { target = k; break; } }
-    NSString *msg = (bin >= 0 && bin == target) ? @"good" : (now - _lastGain > 5 ? @"further" : @"circle");
     NSMutableDictionary *d = [base mutableCopy];
-    d[@"phase"] = @1; d[@"sectors"] = [self sectorCounts]; d[@"target"] = @(target); d[@"code"] = msg; d[@"face"] = @YES;
+    d[@"phase"] = @(_phase); d[@"center"] = @(MIN(_center, kNeedCenter)); d[@"sectors"] = [self sectorCounts];
+    d[@"target"] = @(target); d[@"face"] = @YES;
+    d[@"code"] = (_phase == 0) ? @"" : ((bin >= 0 && bin == target) ? @"good" : (now - _lastGain > 6 ? @"further" : @"circle"));
     [self report:d];
     if (now - _lastDbg > 1.0) {
         _lastDbg = now;
-        PFLog(@"scan %d: %@ full=%d target=%d off %.2f,%.2f samples=%lu", _scanIdx + 1, havePose ? @"landmarks" : @"fallback", full, target, qx, qy, (unsigned long)_got.count);
+        PFLog(@"scan %d: yaw %.2f pitch %.2f bin %d full=%d center=%d samples=%lu", _scanIdx + 1, yaw, pitch, bin, full, _center, (unsigned long)_got.count);
     }
-    if (full >= 6 || (now - _scanStart > 40 && full >= 4)) [self scanComplete:now];
+    if (_phase == 1 && (full >= 6 || (now - _scanStart > 40 && full >= 4))) [self scanComplete:now];
 }
 
 - (void)scanComplete:(NSTimeInterval)now {
@@ -491,29 +465,14 @@ static void PFInstallCrashRecorder(void) {
 - (void)finalizeEnroll {
     NSInteger n = _got.count;
     if (n < 10) { [self finish:NO info:@"not enough face samples were captured"]; return; }
-    NSMutableArray<NSNumber *> *ds = [NSMutableArray new];
+    float base = 0;   // old method: worst-case distance from a sample to its nearest sample of a different head direction
     for (NSInteger i = 0; i < n; i++) {
         float mn = FLT_MAX;
         for (NSInteger j = 0; j < n; j++) {
-            if ([_scanOf[i] intValue] == [_scanOf[j] intValue]) continue;
+            if ([_bins[i] intValue] == [_bins[j] intValue]) continue;
             float d; if ([_got[i] computeDistance:&d toFeaturePrintObservation:_got[j] error:nil]) mn = MIN(mn, d);
         }
-        if (mn < FLT_MAX) [ds addObject:@(mn)];
-    }
-    float base = 0;
-    if (ds.count) {
-        [ds sortUsingSelector:@selector(compare:)];
-        base = [ds[(NSUInteger)floor((ds.count - 1) * 0.95)] floatValue];
-    }
-    if (base <= 0) {   // fallback: nearest sample of a different head direction
-        for (NSInteger i = 0; i < n; i++) {
-            float mn = FLT_MAX;
-            for (NSInteger j = 0; j < n; j++) {
-                if ([_bins[i] intValue] == [_bins[j] intValue]) continue;
-                float d; if ([_got[i] computeDistance:&d toFeaturePrintObservation:_got[j] error:nil]) mn = MIN(mn, d);
-            }
-            if (mn < FLT_MAX) base = MAX(base, mn);
-        }
+        if (mn < FLT_MAX) base = MAX(base, mn);
     }
     if (base <= 0) { [self finish:NO info:@"couldn't measure the face data"]; return; }
     NSDictionary *db = @{@"prints": [_got copy], @"th": @(base * 1.25f), @"base": @(base),
