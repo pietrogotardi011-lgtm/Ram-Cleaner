@@ -115,7 +115,7 @@ static void PFInstallCrashRecorder(void) {
     NSMutableArray *_got; NSMutableArray<NSNumber *> *_bins;
     NSDictionary *_db; void (^_done)(BOOL, NSString *);
     NSString *_interrupt; NSMutableArray *_obs;
-    float _biasX, _biasY, _cSumX, _cSumY; int _cN, _lastSec; NSTimeInterval _lastCap; BOOL _lmBroken, _rectErrLogged;
+    float _biasX, _biasY, _cSumX, _cSumY; int _cN, _lastSec; NSTimeInterval _lastCap; BOOL _lmBroken, _rectErrLogged, _haveRef; float _refX, _refY; int _stableN;
 }
 @synthesize session = _s;
 
@@ -208,7 +208,7 @@ static void PFInstallCrashRecorder(void) {
     _done = [done copy]; _center = 0; memset(_secCount, 0, sizeof _secCount);
     _got = [NSMutableArray new]; _bins = [NSMutableArray new];
     _frames = 0; _interrupt = nil; _lastProc = 0; _retries = 0;
-    _biasX = _biasY = _cSumX = _cSumY = 0; _cN = 0; _lastSec = -1; _lastCap = 0; _lmBroken = NO; _rectErrLogged = NO;
+    _biasX = _biasY = _cSumX = _cSumY = 0; _cN = 0; _lastSec = -1; _lastCap = 0; _lmBroken = NO; _rectErrLogged = NO; _haveRef = NO; _stableN = 0;
     _startTS = CACurrentMediaTime(); _lastFrameTS = _startTS; _lastGain = _startTS;
     _deadlineTS = _startTS + t;
     NSString *err = [self build];
@@ -370,11 +370,14 @@ static void PFInstallCrashRecorder(void) {
         }
         BOOL cd = _center >= kNeedCenter;
         float qx = cd ? px - _biasX : px, qy = cd ? py - _biasY : py;
-        float mag = hypotf(qx, qy);
-        float cthr = havePose ? 0.10f : 0.15f, sthr = havePose ? 0.05f : 0.15f;
+        float tol = havePose ? 0.05f : 0.10f;
         int bin = -2;   // -2 = in between, ignore
-        if (!cd) { if (mag < cthr) bin = -1; }
-        else if (mag >= sthr) bin = ((int)lroundf(atan2f(qy, qx) / (float)(M_PI / 4)) % 8 + 8) % 8;
+        if (!cd) {
+            // step 1: no fixed "centre" - whenever the face holds still, that IS straight ahead (offsets differ per face)
+            if (!_haveRef || hypotf(px - _refX, py - _refY) > tol) { _refX = px; _refY = py; _haveRef = YES; _stableN = 0; }
+            else _stableN++;
+            if (_stableN >= 2) bin = -1;
+        } else if (hypotf(qx, qy) >= tol) bin = ((int)lroundf(atan2f(qy, qx) / (float)(M_PI / 4)) % 8 + 8) % 8;
         BOOL need = (bin == -1) ? (_center < kNeedCenter) : (bin >= 0 ? _secCount[bin] < kNeedPer : NO);
         if (need && now - _lastCap >= 0.25) {
             VNFeaturePrintObservation *fp = [self printFor:pb face:f.boundingBox];
@@ -398,14 +401,14 @@ static void PFInstallCrashRecorder(void) {
         }
         int pct = total * 100 / (kNeedCenter + 8 * kNeedPer);
         NSString *msg, *sub;
-        if (!cd) { msg = @"Look straight at the camera\nand hold still"; sub = [NSString stringWithFormat:@"Step 1 of 2  ·  %d%%", pct]; }
+        if (!cd) { msg = @"Look straight at the camera\nand hold still"; sub = [NSString stringWithFormat:@"Step 1 of 2  ·  %d%%  ·  hold still", pct]; }
         else if (full < 7) {
             if (bin == target) msg = @"Good, hold it there…";
             else msg = (now - _lastGain > 5) ? @"Tilt a little further toward\nthe glowing part of the ring" : @"Slowly move your head toward\nthe glowing part of the ring";
             sub = [NSString stringWithFormat:@"Step 2 of 2  ·  %d%%  ·  keep your face in the circle", pct];
         } else { msg = @"Almost done…"; sub = @"Finishing up"; }
         [self report:@{@"hint": msg, @"sub": sub, @"face": @YES, @"sectors": cnt, @"target": @(target),
-                       @"centerDone": @(cd), @"dx": @(qx), @"dy": @(qy), @"pose": havePose ? @"landmarks" : @"fallback"}];
+                       @"centerDone": @(cd), @"dx": @(qx), @"dy": @(qy), @"dbg": [NSString stringWithFormat:@"%@  c%d  s%@  off %.2f,%.2f", havePose ? @"landmarks" : @"fallback", _center, [cnt componentsJoinedByString:@""], qx, qy]}];
         if (cd && (full >= 7 || (now - _startTS > 55 && full >= 5))) [self finalizeEnroll];
         return;
     }
@@ -516,7 +519,7 @@ static void PFInstallCrashRecorder(void) {
     [_btn addTarget:self action:@selector(tapMain) forControlEvents:UIControlEventTouchUpInside];
     [v addSubview:_btn];
     _ver = [self label:CGRectMake(0, H - 24, W, 16) size:10 weight:UIFontWeightRegular color:[UIColor colorWithWhite:0.4 alpha:1]];
-    _ver.text = @"PhotoFace Enroll build 0.3.8";
+    _ver.text = @"PhotoFace Enroll build 0.3.9";
     [v addSubview:_ver];
 }
 
@@ -596,7 +599,7 @@ static void PFInstallCrashRecorder(void) {
         if (i[@"sectors"]) [self applyRing:i[@"sectors"] target:[i[@"target"] intValue] centerDone:[i[@"centerDone"] boolValue]];
         if (i[@"hint"]) _hint.text = i[@"hint"];
         if (i[@"sub"]) _sub.text = i[@"sub"];
-        if (i[@"pose"]) _ver.text = [NSString stringWithFormat:@"PhotoFace Enroll build 0.3.8  ·  pose: %@", i[@"pose"]];
+        if (i[@"dbg"]) _ver.text = [NSString stringWithFormat:@"build 0.3.9  ·  %@", i[@"dbg"]];
         if ([i[@"face"] boolValue] && i[@"dx"]) {   // live "where is my head pointing" dot
             CGFloat R = _circle.bounds.size.width / 2, k = R / 0.22;
             CGFloat x = [i[@"dx"] floatValue] * k, y = -[i[@"dy"] floatValue] * k, m = hypot(x, y), lim = R * 0.82;
