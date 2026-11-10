@@ -111,6 +111,7 @@ static void PFInstallCrashRecorder(void) {
 @property (atomic) int mode;
 @property (nonatomic, readonly) AVCaptureSession *session;
 @property (nonatomic, readonly) int frameCount;
+@property (nonatomic, readonly) int variant;
 @property (nonatomic, copy) void (^progress)(NSDictionary *info);
 - (void)start:(int)mode timeout:(NSTimeInterval)t done:(void (^)(BOOL, NSString *))done;
 - (void)nextScan;   // enroll: begin the second pass
@@ -120,7 +121,7 @@ static void PFInstallCrashRecorder(void) {
 @implementation PFScan {
     AVCaptureSession *_s; dispatch_queue_t _q, _cfg; NSTimer *_wd;
     NSTimeInterval _startTS, _deadlineTS, _lastFrameTS, _lastProc, _lastGain, _scanStart, _lastCap, _lastDbg;
-    int _frames, _retries, _variant;
+    int _frames, _retries, _variant, _lastState;
     NSMutableArray *_got; NSMutableArray<NSNumber *> *_bins, *_scanOf;
     NSDictionary *_db; void (^_done)(BOOL, NSString *);
     NSString *_interrupt; NSMutableArray *_obs;
@@ -130,6 +131,7 @@ static void PFInstallCrashRecorder(void) {
 }
 @synthesize session = _s;
 - (int)frameCount { return _frames; }
+- (int)variant { return _variant; }
 
 - (instancetype)init {
     if (!(self = [super init])) return nil;
@@ -229,7 +231,7 @@ static void PFInstallCrashRecorder(void) {
     }
     _done = [done copy];
     _got = [NSMutableArray new]; _bins = [NSMutableArray new]; _scanOf = [NSMutableArray new];
-    _frames = 0; _interrupt = nil; _lastProc = 0; _retries = 0; _lastDbg = 0; _scanIdx = 0;
+    _frames = 0; _lastState = 0; _interrupt = nil; _lastProc = 0; _retries = 0; _lastDbg = 0; _scanIdx = 0;
     _lmBroken = NO; _rectErrLogged = NO;
     [self resetScanState];
     _startTS = CACurrentMediaTime(); _lastFrameTS = _startTS;
@@ -263,9 +265,22 @@ static void PFInstallCrashRecorder(void) {
     });
 }
 
+- (void)logState:(NSString *)why {
+    AVCaptureSession *s = _s;
+    AVCaptureDevice *d = [(AVCaptureDeviceInput *)s.inputs.firstObject device];
+    AVCaptureVideoDataOutput *o = nil;
+    for (AVCaptureOutput *x in s.outputs) if ([x isKindOfClass:[AVCaptureVideoDataOutput class]]) o = (AVCaptureVideoDataOutput *)x;
+    AVCaptureConnection *c = [o connectionWithMediaType:AVMediaTypeVideo];
+    PFLog(@"state(%@): variant=%d session running=%d interrupted=%d inputs=%lu outputs=%lu | device connected=%d suspended=%d inUseByOtherApp=%d fmt=%@ | conn enabled=%d active=%d | delegate=%@ queue=%@ | frames=%d",
+          why, _variant, s.isRunning, s.isInterrupted, (unsigned long)s.inputs.count, (unsigned long)s.outputs.count,
+          d.isConnected, d.isSuspended, d.isInUseByAnotherApplication, d.activeFormat, c.isEnabled, c.isActive,
+          o.sampleBufferDelegate ? @"set" : @"NIL", o.sampleBufferCallbackQueue ? @"set" : @"NIL", _frames);
+}
+
 - (void)tick {
     if (!self.mode) return;
     NSTimeInterval n = CACurrentMediaTime();
+    if (_frames == 0 && n - _startTS > 2.0 && _lastState != _retries + 1) { _lastState = _retries + 1; [self logState:@"no-frames"]; }
     BOOL held = _s.isInterrupted;
     if (_frames == 0 && _retries < 4 && n - _startTS > 3.0 * (_retries + 1)) {
         _retries++;
@@ -679,7 +694,7 @@ typedef NS_ENUM(int, PFStage) { PFStageIntro, PFStageScan, PFStageBetween, PFSta
     if (!kShowLivePreview) return;
     AVCaptureSession *s = _scan.session;
     if (!s) return;
-    if (_scan.frameCount == 0) { if (_pl) { [_pl removeFromSuperlayer]; _pl = nil; } return; }   // attach the preview only once frames are flowing
+    if (_scan.frameCount == 0 && _scan.variant == 1) { if (_pl) { [_pl removeFromSuperlayer]; _pl = nil; } return; }   // attempt 2 runs WITHOUT a preview layer, to test whether it starves the frame output
     if (_pl) { if (_pl.session != s) _pl.session = s; return; }
     _pl = [AVCaptureVideoPreviewLayer layerWithSession:s];
     _pl.videoGravity = AVLayerVideoGravityResizeAspectFill;
@@ -784,6 +799,12 @@ typedef NS_ENUM(int, PFStage) { PFStageIntro, PFStageScan, PFStageBetween, PFSta
 }
 
 - (void)showFail:(NSString *)info {
+    NSString *all = [NSString stringWithContentsOfFile:[kDir stringByAppendingPathComponent:@"log.txt"] encoding:NSUTF8StringEncoding error:nil];
+    if (all.length) {
+        NSArray *ls = [all componentsSeparatedByString:@"\n"]; NSUInteger from = ls.count > 45 ? ls.count - 45 : 0;
+        [UIPasteboard generalPasteboard].string = [[ls subarrayWithRange:NSMakeRange(from, ls.count - from)] componentsJoinedByString:@"\n"];
+        info = [info stringByAppendingString:@"\n\nDiagnostics copied: paste them to Claude."];
+    }
     _stage = PFStageFail; [self detachPreview];
     _circle.hidden = YES; [self showRing:NO]; _disc.hidden = YES; _check.hidden = YES;
     _glyph.hidden = NO; _glyph.strokeColor = [UIColor colorWithRed:1 green:0.35 blue:0.3 alpha:1].CGColor;
