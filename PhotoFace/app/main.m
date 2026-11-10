@@ -47,6 +47,7 @@ static void PFWriteStatus(NSString *s) {
     chmod(p.fileSystemRepresentation, 0644);
 }
 static UIColor *PFGreen(void) { return [UIColor colorWithRed:0.19 green:0.82 blue:0.35 alpha:1]; }
+static UIColor *PFDim(void) { return [UIColor colorWithRed:0.19 green:0.82 blue:0.35 alpha:0.28]; }   // always-visible ring track
 
 static NSDictionary *PFLoadDB(void) {
     NSData *d = [NSData dataWithContentsOfFile:PFDBPath()];
@@ -370,7 +371,7 @@ static void PFInstallCrashRecorder(void) {
         }
         BOOL cd = _center >= kNeedCenter;
         float qx = cd ? px - _biasX : px, qy = cd ? py - _biasY : py;
-        float tol = havePose ? 0.05f : 0.10f;
+        float tol = havePose ? 0.04f : 0.10f;
         int bin = -2;   // -2 = in between, ignore
         if (!cd) {
             // step 1: no fixed "centre" - whenever the face holds still, that IS straight ahead (offsets differ per face)
@@ -404,11 +405,11 @@ static void PFInstallCrashRecorder(void) {
         if (!cd) { msg = @"Look straight at the camera\nand hold still"; sub = [NSString stringWithFormat:@"Step 1 of 2  ·  %d%%  ·  hold still", pct]; }
         else if (full < 7) {
             if (bin == target) msg = @"Good, hold it there…";
-            else msg = (now - _lastGain > 5) ? @"Tilt a little further toward\nthe glowing part of the ring" : @"Slowly move your head toward\nthe glowing part of the ring";
+            else msg = (now - _lastGain > 5) ? @"Tilt a little further toward\nthe bright green part of the ring" : @"Slowly move your head toward\nthe bright green part of the ring";
             sub = [NSString stringWithFormat:@"Step 2 of 2  ·  %d%%  ·  keep your face in the circle", pct];
         } else { msg = @"Almost done…"; sub = @"Finishing up"; }
         [self report:@{@"hint": msg, @"sub": sub, @"face": @YES, @"sectors": cnt, @"target": @(target),
-                       @"centerDone": @(cd), @"dx": @(qx), @"dy": @(qy), @"dbg": [NSString stringWithFormat:@"%@  c%d  s%@  off %.2f,%.2f", havePose ? @"landmarks" : @"fallback", _center, [cnt componentsJoinedByString:@""], qx, qy]}];
+                       @"centerDone": @(cd), @"center": @(MIN(_center, kNeedCenter)), @"dx": @(qx), @"dy": @(qy), @"dbg": [NSString stringWithFormat:@"%@  c%d  s%@  off %.2f,%.2f", havePose ? @"landmarks" : @"fallback", _center, [cnt componentsJoinedByString:@""], qx, qy]}];
         if (cd && (full >= 7 || (now - _startTS > 55 && full >= 5))) [self finalizeEnroll];
         return;
     }
@@ -484,13 +485,13 @@ static void PFInstallCrashRecorder(void) {
 
     _ticks = [NSMutableArray new];
     for (int i = 0; i < 24; i++) {
-        CGFloat a = -M_PI_2 + i * 2 * M_PI / 24, r1 = d / 2 + 10, r2 = d / 2 + 22;
+        CGFloat a = -M_PI_2 + i * 2 * M_PI / 24, r1 = d / 2 + 8, r2 = d / 2 + 26;
         UIBezierPath *p = [UIBezierPath bezierPath];
         [p moveToPoint:CGPointMake(cx + r1 * cos(a), cy + r1 * sin(a))];
         [p addLineToPoint:CGPointMake(cx + r2 * cos(a), cy + r2 * sin(a))];
         CAShapeLayer *l = [CAShapeLayer layer];
-        l.path = p.CGPath; l.lineWidth = 4; l.lineCap = kCALineCapRound;
-        l.strokeColor = [UIColor colorWithWhite:0.25 alpha:1].CGColor;
+        l.path = p.CGPath; l.lineWidth = 7; l.lineCap = kCALineCapRound;
+        l.strokeColor = PFDim().CGColor;
         [v.layer addSublayer:l]; [_ticks addObject:l];
         float th = (90.f - 15.f * i) * (float)M_PI / 180.f;   // screen direction of this tick, counter-clockwise from "right"
         _tickSector[i] = ((int)lroundf(th / (float)(M_PI / 4)) % 8 + 8) % 8;
@@ -519,13 +520,13 @@ static void PFInstallCrashRecorder(void) {
     [_btn addTarget:self action:@selector(tapMain) forControlEvents:UIControlEventTouchUpInside];
     [v addSubview:_btn];
     _ver = [self label:CGRectMake(0, H - 24, W, 16) size:10 weight:UIFontWeightRegular color:[UIColor colorWithWhite:0.4 alpha:1]];
-    _ver.text = @"PhotoFace Enroll build 0.3.9";
+    _ver.text = @"PhotoFace Enroll build 0.4.0";
     [v addSubview:_ver];
 }
 
 - (void)lightTicks:(int)n color:(UIColor *)c {
     for (int i = 0; i < (int)_ticks.count; i++)
-        _ticks[i].strokeColor = (i < n ? c : [UIColor colorWithWhite:0.25 alpha:1]).CGColor;
+        _ticks[i].strokeColor = (i < n ? c : PFDim()).CGColor;
 }
 
 - (void)attachPreview {
@@ -570,36 +571,44 @@ static void PFInstallCrashRecorder(void) {
     }];
 }
 
-- (void)applyRing:(NSArray *)cnt target:(int)tgt centerDone:(BOOL)cd {
+- (void)applyRing:(NSArray *)cnt target:(int)tgt centerDone:(BOOL)cd center:(int)center {
     int per[8] = {0}, idx[24];
     for (int i = 0; i < 24; i++) idx[i] = per[_tickSector[i]]++;
     if (tgt != _pulseTarget) { for (CAShapeLayer *l in _ticks) [l removeAllAnimations]; _pulseTarget = tgt; }
     for (int i = 0; i < 24; i++) {
+        CAShapeLayer *l = _ticks[i];
+        if (!cd) {
+            // step 1: the whole ring fills green, clockwise from the top, while you hold still
+            int lit = (int)ceilf(24.f * center / (float)kNeedCenter);
+            l.strokeColor = (i < lit ? PFGreen() : PFDim()).CGColor;
+            [l removeAnimationForKey:@"pulse"];
+            continue;
+        }
         int sct = _tickSector[i], c = MIN([cnt[sct] intValue], kNeedPer);
         int filled = (int)ceilf(per[sct] * c / (float)kNeedPer);
-        CAShapeLayer *l = _ticks[i];
         if (idx[i] < filled) { l.strokeColor = PFGreen().CGColor; [l removeAnimationForKey:@"pulse"]; }
         else if (sct == tgt) {
-            l.strokeColor = UIColor.whiteColor.CGColor;
+            // the part of the ring to head toward: bright green, pulsing
+            l.strokeColor = [UIColor colorWithRed:0.45 green:1 blue:0.6 alpha:1].CGColor;
             if (![l animationForKey:@"pulse"]) {
                 CABasicAnimation *a = [CABasicAnimation animationWithKeyPath:@"opacity"];
-                a.fromValue = @1; a.toValue = @0.25; a.duration = 0.55; a.autoreverses = YES; a.repeatCount = HUGE_VALF;
+                a.fromValue = @1; a.toValue = @0.2; a.duration = 0.5; a.autoreverses = YES; a.repeatCount = HUGE_VALF;
                 [l addAnimation:a forKey:@"pulse"];
             }
-        } else { l.strokeColor = [UIColor colorWithWhite:0.25 alpha:1].CGColor; [l removeAnimationForKey:@"pulse"]; }
+        } else { l.strokeColor = PFDim().CGColor; [l removeAnimationForKey:@"pulse"]; }
     }
     _circle.layer.borderWidth = 3;
-    _circle.layer.borderColor = (cd ? PFGreen() : [UIColor colorWithWhite:0.3 alpha:1]).CGColor;
+    _circle.layer.borderColor = (cd ? PFGreen() : PFDim()).CGColor;
 }
 
 - (void)update:(NSDictionary *)i {
     if (_finished) return;
     [self attachPreview];
     if (_mode == 2) {
-        if (i[@"sectors"]) [self applyRing:i[@"sectors"] target:[i[@"target"] intValue] centerDone:[i[@"centerDone"] boolValue]];
+        if (i[@"sectors"]) [self applyRing:i[@"sectors"] target:[i[@"target"] intValue] centerDone:[i[@"centerDone"] boolValue] center:[i[@"center"] intValue]];
         if (i[@"hint"]) _hint.text = i[@"hint"];
         if (i[@"sub"]) _sub.text = i[@"sub"];
-        if (i[@"dbg"]) _ver.text = [NSString stringWithFormat:@"build 0.3.9  ·  %@", i[@"dbg"]];
+        if (i[@"dbg"]) _ver.text = [NSString stringWithFormat:@"build 0.4.0  ·  %@", i[@"dbg"]];
         if ([i[@"face"] boolValue] && i[@"dx"]) {   // live "where is my head pointing" dot
             CGFloat R = _circle.bounds.size.width / 2, k = R / 0.22;
             CGFloat x = [i[@"dx"] floatValue] * k, y = -[i[@"dy"] floatValue] * k, m = hypot(x, y), lim = R * 0.82;
