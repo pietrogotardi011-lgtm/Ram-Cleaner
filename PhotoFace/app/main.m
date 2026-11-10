@@ -623,7 +623,7 @@ typedef NS_ENUM(int, PFStage) { PFStageIntro, PFStageScan, PFStageBetween, PFSta
     _cancel.contentHorizontalAlignment = UIControlContentHorizontalAlignmentLeft;
     [v addSubview:_cancel];
     _ver = [self label:CGRectMake(0, H - 16, W, 12) size:9 weight:UIFontWeightRegular color:[UIColor colorWithWhite:0.3 alpha:1]];
-    _ver.text = @"PhotoFace Enroll build 0.5.0";
+    _ver.text = [NSString stringWithFormat:@"PhotoFace Enroll build %@", [[NSBundle mainBundle] objectForInfoDictionaryKey:@"CFBundleShortVersionString"] ?: @"?"];
     [v addSubview:_ver];
     _primary.hidden = YES; _cancel.hidden = YES;
 }
