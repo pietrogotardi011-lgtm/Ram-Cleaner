@@ -110,6 +110,7 @@ static void PFInstallCrashRecorder(void) {
 @interface PFScan : NSObject <AVCaptureVideoDataOutputSampleBufferDelegate>
 @property (atomic) int mode;
 @property (nonatomic, readonly) AVCaptureSession *session;
+@property (nonatomic, readonly) int frameCount;
 @property (nonatomic, copy) void (^progress)(NSDictionary *info);
 - (void)start:(int)mode timeout:(NSTimeInterval)t done:(void (^)(BOOL, NSString *))done;
 - (void)nextScan;   // enroll: begin the second pass
@@ -119,7 +120,7 @@ static void PFInstallCrashRecorder(void) {
 @implementation PFScan {
     AVCaptureSession *_s; dispatch_queue_t _q, _cfg; NSTimer *_wd;
     NSTimeInterval _startTS, _deadlineTS, _lastFrameTS, _lastProc, _lastGain, _scanStart, _lastCap, _lastDbg;
-    int _frames, _retries;
+    int _frames, _retries, _variant;
     NSMutableArray *_got; NSMutableArray<NSNumber *> *_bins, *_scanOf;
     NSDictionary *_db; void (^_done)(BOOL, NSString *);
     NSString *_interrupt; NSMutableArray *_obs;
@@ -128,6 +129,7 @@ static void PFInstallCrashRecorder(void) {
     float _biasX, _biasY, _cSumX, _cSumY; BOOL _lmBroken, _rectErrLogged;
 }
 @synthesize session = _s;
+- (int)frameCount { return _frames; }
 
 - (instancetype)init {
     if (!(self = [super init])) return nil;
@@ -159,18 +161,22 @@ static void PFInstallCrashRecorder(void) {
     AVCaptureSession *s = [AVCaptureSession new];
     if (@available(iOS 10.0, *)) s.automaticallyConfiguresCaptureDeviceForWideColor = NO;
     [s beginConfiguration];
-    if ([s canSetSessionPreset:AVCaptureSessionPreset640x480]) s.sessionPreset = AVCaptureSessionPreset640x480;
+    int variant = _retries;   // each retry tries a different configuration; the log says which one delivers frames
+    _variant = variant;
+    if (variant != 2 && [s canSetSessionPreset:AVCaptureSessionPreset640x480]) s.sessionPreset = AVCaptureSessionPreset640x480;
     if (![s canAddInput:in]) { [s commitConfiguration]; return @"can't add camera input"; }
     [s addInput:in];
     AVCaptureVideoDataOutput *o = [AVCaptureVideoDataOutput new];
-    o.videoSettings = @{(id)kCVPixelBufferPixelFormatTypeKey: @(kCVPixelFormatType_32BGRA)};
-    o.alwaysDiscardsLateVideoFrames = YES;
-    [o setSampleBufferDelegate:self queue:_q];
+    if (variant == 0 || variant >= 3) o.videoSettings = @{(id)kCVPixelBufferPixelFormatTypeKey: @(kCVPixelFormatType_32BGRA)};
+    o.alwaysDiscardsLateVideoFrames = (variant != 4);
+    [o setSampleBufferDelegate:self queue:(variant == 3 ? dispatch_get_main_queue() : _q)];
     if (![s canAddOutput:o]) { [s commitConfiguration]; return @"can't add camera output"; }
     [s addOutput:o];
     AVCaptureConnection *c = [o connectionWithMediaType:AVMediaTypeVideo];
     if (c.isVideoOrientationSupported) c.videoOrientation = AVCaptureVideoOrientationPortrait;
+    c.enabled = YES;
     [s commitConfiguration];
+    PFLog(@"camera config variant %d: preset=%@ connections=%lu enabled=%d active=%d format=%@", variant, s.sessionPreset, (unsigned long)o.connections.count, c.isEnabled, c.isActive, o.videoSettings[(id)kCVPixelBufferPixelFormatTypeKey]);
     _s = s;
     __weak PFScan *ws = self;
     NSNotificationCenter *nc = [NSNotificationCenter defaultCenter];
@@ -344,6 +350,7 @@ static void PFInstallCrashRecorder(void) {
 - (void)captureOutput:(AVCaptureOutput *)o didOutputSampleBuffer:(CMSampleBufferRef)sb fromConnection:(AVCaptureConnection *)c {
     NSTimeInterval now = CACurrentMediaTime();
     _frames++; _lastFrameTS = now;
+    if (_frames == 1) PFLog(@"FIRST FRAME received (config variant %d)", _variant);
     int mode = self.mode;
     if (!mode) return;
     if (mode == 2 && _phase >= 2) return;   // paused between passes, or finishing
@@ -672,6 +679,7 @@ typedef NS_ENUM(int, PFStage) { PFStageIntro, PFStageScan, PFStageBetween, PFSta
     if (!kShowLivePreview) return;
     AVCaptureSession *s = _scan.session;
     if (!s) return;
+    if (_scan.frameCount == 0) { if (_pl) { [_pl removeFromSuperlayer]; _pl = nil; } return; }   // attach the preview only once frames are flowing
     if (_pl) { if (_pl.session != s) _pl.session = s; return; }
     _pl = [AVCaptureVideoPreviewLayer layerWithSession:s];
     _pl.videoGravity = AVLayerVideoGravityResizeAspectFill;
