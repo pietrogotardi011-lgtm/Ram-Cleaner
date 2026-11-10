@@ -115,7 +115,7 @@ static void PFInstallCrashRecorder(void) {
     NSMutableArray *_got; NSMutableArray<NSNumber *> *_bins;
     NSDictionary *_db; void (^_done)(BOOL, NSString *);
     NSString *_interrupt; NSMutableArray *_obs;
-    float _biasX, _biasY, _cSumX, _cSumY; int _cN, _lastSec; NSTimeInterval _lastCap;
+    float _biasX, _biasY, _cSumX, _cSumY; int _cN, _lastSec; NSTimeInterval _lastCap; BOOL _lmBroken, _rectErrLogged;
 }
 @synthesize session = _s;
 
@@ -208,7 +208,7 @@ static void PFInstallCrashRecorder(void) {
     _done = [done copy]; _center = 0; memset(_secCount, 0, sizeof _secCount);
     _got = [NSMutableArray new]; _bins = [NSMutableArray new];
     _frames = 0; _interrupt = nil; _lastProc = 0; _retries = 0;
-    _biasX = _biasY = _cSumX = _cSumY = 0; _cN = 0; _lastSec = -1; _lastCap = 0;
+    _biasX = _biasY = _cSumX = _cSumY = 0; _cN = 0; _lastSec = -1; _lastCap = 0; _lmBroken = NO; _rectErrLogged = NO;
     _startTS = CACurrentMediaTime(); _lastFrameTS = _startTS; _lastGain = _startTS;
     _deadlineTS = _startTS + t;
     NSString *err = [self build];
@@ -323,9 +323,25 @@ static void PFInstallCrashRecorder(void) {
     CVPixelBufferRef pb = CMSampleBufferGetImageBuffer(sb);
     if (!pb) return;
 
-    VNRequest *fr = (mode == 2) ? (VNRequest *)[VNDetectFaceLandmarksRequest new] : (VNRequest *)[VNDetectFaceRectanglesRequest new];
     VNImageRequestHandler *h = [[VNImageRequestHandler alloc] initWithCVPixelBuffer:pb options:@{}];
-    if (![h performRequests:@[fr] error:nil]) return;
+    VNRequest *fr = nil; BOOL usedLM = NO; NSError *verr = nil;
+    if (mode == 2 && !_lmBroken) {
+        VNDetectFaceLandmarksRequest *lr = [VNDetectFaceLandmarksRequest new];
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wdeprecated-declarations"
+        lr.usesCPUOnly = YES;   // GPU/ANE paths are not available to this unsandboxed app (same cause as the Core Image crash)
+#pragma clang diagnostic pop
+        if ([h performRequests:@[lr] error:&verr]) { fr = lr; usedLM = YES; }
+        else { _lmBroken = YES; PFLog(@"landmarks request failed (%@) - falling back to plain face detection", verr); }
+    }
+    if (!fr) {
+        VNDetectFaceRectanglesRequest *rr = [VNDetectFaceRectanglesRequest new];
+        if (![h performRequests:@[rr] error:&verr]) {
+            if (!_rectErrLogged) { _rectErrLogged = YES; PFLog(@"face detection failed: %@", verr); }
+            return;
+        }
+        fr = rr;
+    }
     NSArray *faces = fr.results;
     NSString *hint = nil; VNFaceObservation *f = nil;
     if (faces.count == 0) hint = @"Can't see your face.\nLook at the front camera.";
@@ -389,7 +405,7 @@ static void PFInstallCrashRecorder(void) {
             sub = [NSString stringWithFormat:@"Step 2 of 2  ·  %d%%  ·  keep your face in the circle", pct];
         } else { msg = @"Almost done…"; sub = @"Finishing up"; }
         [self report:@{@"hint": msg, @"sub": sub, @"face": @YES, @"sectors": cnt, @"target": @(target),
-                       @"centerDone": @(cd), @"dx": @(qx), @"dy": @(qy)}];
+                       @"centerDone": @(cd), @"dx": @(qx), @"dy": @(qy), @"pose": havePose ? @"landmarks" : @"fallback"}];
         if (cd && (full >= 7 || (now - _startTS > 55 && full >= 5))) [self finalizeEnroll];
         return;
     }
@@ -433,7 +449,7 @@ static void PFInstallCrashRecorder(void) {
 @implementation PFVC {
     PFScan *_scan; UIView *_circle; AVCaptureVideoPreviewLayer *_pl;
     NSMutableArray<CAShapeLayer *> *_ticks; CAShapeLayer *_dot; int _tickSector[24], _pulseTarget;
-    UILabel *_title, *_hint, *_sub; UIButton *_btn;
+    UILabel *_title, *_hint, *_sub, *_ver; UIButton *_btn;
     int _mode; BOOL _running, _finished;
 }
 - (BOOL)isRunning { return _running && !_finished; }
@@ -499,9 +515,9 @@ static void PFInstallCrashRecorder(void) {
     [_btn setTitleColor:UIColor.whiteColor forState:UIControlStateNormal];
     [_btn addTarget:self action:@selector(tapMain) forControlEvents:UIControlEventTouchUpInside];
     [v addSubview:_btn];
-    UILabel *ver = [self label:CGRectMake(0, H - 24, W, 16) size:10 weight:UIFontWeightRegular color:[UIColor colorWithWhite:0.4 alpha:1]];
-    ver.text = @"PhotoFace Enroll build 0.3.6";
-    [v addSubview:ver];
+    _ver = [self label:CGRectMake(0, H - 24, W, 16) size:10 weight:UIFontWeightRegular color:[UIColor colorWithWhite:0.4 alpha:1]];
+    _ver.text = @"PhotoFace Enroll build 0.3.7";
+    [v addSubview:_ver];
 }
 
 - (void)lightTicks:(int)n color:(UIColor *)c {
@@ -580,6 +596,7 @@ static void PFInstallCrashRecorder(void) {
         if (i[@"sectors"]) [self applyRing:i[@"sectors"] target:[i[@"target"] intValue] centerDone:[i[@"centerDone"] boolValue]];
         if (i[@"hint"]) _hint.text = i[@"hint"];
         if (i[@"sub"]) _sub.text = i[@"sub"];
+        if (i[@"pose"]) _ver.text = [NSString stringWithFormat:@"PhotoFace Enroll build 0.3.7  ·  pose: %@", i[@"pose"]];
         if ([i[@"face"] boolValue] && i[@"dx"]) {   // live "where is my head pointing" dot
             CGFloat R = _circle.bounds.size.width / 2, k = R / 0.22;
             CGFloat x = [i[@"dx"] floatValue] * k, y = -[i[@"dy"] floatValue] * k, m = hypot(x, y), lim = R * 0.82;
