@@ -19,7 +19,7 @@
 static NSString *const kDir = @"/var/mobile/Library/PhotoFace";
 static CFStringRef const kPrefDom = CFSTR("com.photoface.tweak");
 #define kNeedCenter 6   // straight-ahead samples
-#define kNeedPer 3      // samples per head direction (8 directions)
+#define kNeedPer 2      // samples per head direction (8 directions)
 
 #pragma mark - helpers
 
@@ -375,9 +375,9 @@ static void PFInstallCrashRecorder(void) {
         int bin = -2;   // -2 = in between, ignore
         if (!cd) {
             // step 1: no fixed "centre" - whenever the face holds still, that IS straight ahead (offsets differ per face)
-            if (!_haveRef || hypotf(px - _refX, py - _refY) > tol) { _refX = px; _refY = py; _haveRef = YES; _stableN = 0; }
-            else _stableN++;
-            if (_stableN >= 2) bin = -1;
+            // (0.4.1) no stillness gate any more: any frame with a face counts as "straight ahead", unless it is clearly
+            // turned away from the straight-ahead frames already taken
+            if (_cN == 0 || hypotf(px - _cSumX / _cN, py - _cSumY / _cN) < 0.12f) bin = -1;
         } else if (hypotf(qx, qy) >= tol) bin = ((int)lroundf(atan2f(qy, qx) / (float)(M_PI / 4)) % 8 + 8) % 8;
         BOOL need = (bin == -1) ? (_center < kNeedCenter) : (bin >= 0 ? _secCount[bin] < kNeedPer : NO);
         if (need && now - _lastCap >= 0.25) {
@@ -403,14 +403,14 @@ static void PFInstallCrashRecorder(void) {
         int pct = total * 100 / (kNeedCenter + 8 * kNeedPer);
         NSString *msg, *sub;
         if (!cd) { msg = @"Look straight at the camera\nand hold still"; sub = [NSString stringWithFormat:@"Step 1 of 2  ·  %d%%  ·  hold still", pct]; }
-        else if (full < 7) {
+        else if (full < 6) {
             if (bin == target) msg = @"Good, hold it there…";
             else msg = (now - _lastGain > 5) ? @"Tilt a little further toward\nthe bright green part of the ring" : @"Slowly move your head toward\nthe bright green part of the ring";
             sub = [NSString stringWithFormat:@"Step 2 of 2  ·  %d%%  ·  keep your face in the circle", pct];
         } else { msg = @"Almost done…"; sub = @"Finishing up"; }
         [self report:@{@"hint": msg, @"sub": sub, @"face": @YES, @"sectors": cnt, @"target": @(target),
                        @"centerDone": @(cd), @"center": @(MIN(_center, kNeedCenter)), @"dx": @(qx), @"dy": @(qy), @"dbg": [NSString stringWithFormat:@"%@  c%d  s%@  off %.2f,%.2f", havePose ? @"landmarks" : @"fallback", _center, [cnt componentsJoinedByString:@""], qx, qy]}];
-        if (cd && (full >= 7 || (now - _startTS > 55 && full >= 5))) [self finalizeEnroll];
+        if (cd && (full >= 6 || (now - _startTS > 45 && full >= 4))) [self finalizeEnroll];
         return;
     }
 
@@ -520,7 +520,7 @@ static void PFInstallCrashRecorder(void) {
     [_btn addTarget:self action:@selector(tapMain) forControlEvents:UIControlEventTouchUpInside];
     [v addSubview:_btn];
     _ver = [self label:CGRectMake(0, H - 24, W, 16) size:10 weight:UIFontWeightRegular color:[UIColor colorWithWhite:0.4 alpha:1]];
-    _ver.text = @"PhotoFace Enroll build 0.4.0";
+    _ver.text = @"PhotoFace Enroll build 0.4.1";
     [v addSubview:_ver];
 }
 
@@ -561,7 +561,7 @@ static void PFInstallCrashRecorder(void) {
     _scan = [PFScan new];
     __weak PFVC *ws = self;
     _scan.progress = ^(NSDictionary *i) { [ws update:i]; };
-    [_scan start:mode timeout:(mode == 2 ? 75 : 90) done:^(BOOL ok, NSString *info) { [ws finished:ok info:info]; }];
+    [_scan start:mode timeout:(mode == 2 ? 120 : 90) done:^(BOOL ok, NSString *info) { [ws finished:ok info:info]; }];
     PFLog(@"startMode: scan started, attaching preview");
     [self attachPreview];
     // the session can be rebuilt on a retry; keep the preview attached
@@ -608,7 +608,7 @@ static void PFInstallCrashRecorder(void) {
         if (i[@"sectors"]) [self applyRing:i[@"sectors"] target:[i[@"target"] intValue] centerDone:[i[@"centerDone"] boolValue] center:[i[@"center"] intValue]];
         if (i[@"hint"]) _hint.text = i[@"hint"];
         if (i[@"sub"]) _sub.text = i[@"sub"];
-        if (i[@"dbg"]) _ver.text = [NSString stringWithFormat:@"build 0.4.0  ·  %@", i[@"dbg"]];
+        if (i[@"dbg"]) _ver.text = [NSString stringWithFormat:@"build 0.4.1  ·  %@", i[@"dbg"]];
         if ([i[@"face"] boolValue] && i[@"dx"]) {   // live "where is my head pointing" dot
             CGFloat R = _circle.bounds.size.width / 2, k = R / 0.22;
             CGFloat x = [i[@"dx"] floatValue] * k, y = -[i[@"dy"] floatValue] * k, m = hypot(x, y), lim = R * 0.82;
