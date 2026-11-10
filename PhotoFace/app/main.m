@@ -416,14 +416,20 @@ static void PFInstallCrashRecorder(void) {
     float yaw = NAN, pitch = NAN;
     if (f.yaw) yaw = f.yaw.floatValue;
     if (@available(iOS 15.0, *)) { if (f.pitch) pitch = f.pitch.floatValue; }
-    int bin;
-    if (isnan(yaw) || isnan(pitch)) bin = (_center < kNeedCenter) ? -1 : (int)(_got.count % 8);
-    else {
+    int bin = -2;   // -2 = don't capture this frame
+    BOOL poseOK = !(isnan(yaw) || isnan(pitch));
+    // guards: a real, stable pose, face not turned away, and photos spaced out (no bursts)
+    BOOL stable = NO;
+    if (poseOK) {
+        stable = (_cN > 0) && hypotf(yaw - _biasX, pitch - _biasY) < 0.12f;
+        _biasX = yaw; _biasY = pitch; _cN = 1;
         float mag = hypotf(yaw, pitch);
+        if (mag > 0.85f) { NSMutableDictionary *d = [base mutableCopy]; d[@"code"] = @"nface"; d[@"face"] = @NO; [self report:d]; return; }   // looking away
         if (mag < 0.15f) bin = -1;
         else bin = ((int)lroundf(atan2f(pitch, yaw) / (float)(M_PI / 4)) + 8) % 8;
-    }
-    BOOL need = (bin == -1) ? (_center < kNeedCenter) : (_secCount[bin] < kNeedPer);
+    } else if (now - _lastDbg > 1.0) PFLog(@"enroll: no yaw/pitch from Vision (yaw=%@ pitch=%@) - not capturing", f.yaw, @(pitch));
+    BOOL need = poseOK && stable && now - _lastCap >= 0.35 &&
+                ((bin == -1) ? (_center < kNeedCenter) : (bin >= 0 && _secCount[bin] < kNeedPer));
     if (need) {
         VNFeaturePrintObservation *fp = [self printFor:pb face:f.boundingBox];
         if (fp) {
