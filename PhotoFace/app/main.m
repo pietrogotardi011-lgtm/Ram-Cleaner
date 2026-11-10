@@ -499,6 +499,9 @@ static void PFInstallCrashRecorder(void) {
     [_btn setTitleColor:UIColor.whiteColor forState:UIControlStateNormal];
     [_btn addTarget:self action:@selector(tapMain) forControlEvents:UIControlEventTouchUpInside];
     [v addSubview:_btn];
+    UILabel *ver = [self label:CGRectMake(0, H - 24, W, 16) size:10 weight:UIFontWeightRegular color:[UIColor colorWithWhite:0.4 alpha:1]];
+    ver.text = @"PhotoFace Enroll build 0.3.6";
+    [v addSubview:ver];
 }
 
 - (void)lightTicks:(int)n color:(UIColor *)c {

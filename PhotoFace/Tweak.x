@@ -638,13 +638,17 @@ static float PFLimit(NSDictionary *db) {
     PFLogEnv("before-launch");
     if ([PFScanner shared].mode) [[PFScanner shared] cancel];   // free the camera from any lock-screen scan
     [[NSFileManager defaultManager] removeItemAtPath:[kDir stringByAppendingPathComponent:@"status.txt"] error:nil];
-    NSString *mp = [kDir stringByAppendingPathComponent:@"mode.txt"];
-    [[NSString stringWithFormat:@"%d", mode] writeToFile:mp atomically:YES encoding:NSUTF8StringEncoding error:nil];
-    chmod(mp.fileSystemRepresentation, 0644);
-    if (!PFLaunchEnrollApp()) {
-        PFEnrollAbort(@"couldn't launch the PhotoFace Enroll app (is it installed? run uicache)");
-        return;
-    }
+    // kill any stale Enroll process first (respring/updates don't stop a backgrounded app, so old code could keep running)
+    id svc = [%c(FBSSystemService) sharedService];
+    SEL tsel = NSSelectorFromString(@"terminateApplication:forReason:andReport:withDescription:");
+    if (svc && [svc respondsToSelector:tsel]) ((void (*)(id, SEL, id, long long, BOOL, id))objc_msgSend)(svc, tsel, kEnrollApp, 1, NO, @"PhotoFace restart");
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 700 * NSEC_PER_MSEC), dispatch_get_main_queue(), ^{
+        if (!gEnrolling || gEnrollGen != gen) return;
+        NSString *mp = [kDir stringByAppendingPathComponent:@"mode.txt"];
+        [[NSString stringWithFormat:@"%d", mode] writeToFile:mp atomically:YES encoding:NSUTF8StringEncoding error:nil];
+        chmod(mp.fileSystemRepresentation, 0644);
+        if (!PFLaunchEnrollApp()) PFEnrollAbort(@"couldn't launch the PhotoFace Enroll app (is it installed? run uicache)");
+    });
     // if the app never reports back (killed, crashed) don't stay stuck
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 200 * NSEC_PER_SEC), dispatch_get_main_queue(), ^{
         if (gEnrolling && gEnrollGen == gen) {

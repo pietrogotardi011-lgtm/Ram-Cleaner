@@ -2,6 +2,8 @@
 mkdir -p /var/mobile/Library/PhotoFace
 chown -R mobile:mobile /var/mobile/Library/PhotoFace 2>/dev/null
 chmod 700 /var/mobile/Library/PhotoFace 2>/dev/null
+# stop any running (old) Enroll app, then register the new one
+killall -9 PhotoFaceEnroll >/dev/null 2>&1
 # register the hidden Enroll app
 uicache -p /Applications/PhotoFaceEnroll.app >/dev/null 2>&1 || uicache >/dev/null 2>&1
 # no respring here: the package manager does it after dpkg finishes
